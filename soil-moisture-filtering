@@ -1,0 +1,157 @@
+#include <msp430.h>
+#include <stdint.h>
+
+// ================= UART =================
+void uart_init(void)
+{
+    P1SEL  |= BIT1 | BIT2;
+    P1SEL2 |= BIT1 | BIT2;
+
+    UCA0CTL1 |= UCSSEL_2;
+    UCA0BR0 = 104;
+    UCA0BR1 = 0;
+    UCA0MCTL = UCBRS0;
+    UCA0CTL1 &= ~UCSWRST;
+}
+
+void uart_tx(char c)
+{
+    while (!(IFG2 & UCA0TXIFG));
+    UCA0TXBUF = c;
+}
+
+void uart_print(const char *s)
+{
+    while (*s) uart_tx(*s++);
+}
+
+void uart_print_num(int n)
+{
+    char buf[6];
+    int i = 0;
+
+    if (n == 0) { uart_tx('0'); return; }
+
+    if (n < 0)
+    {
+        uart_tx('-');
+        n = -n;
+    }
+
+    while (n)
+    {
+        buf[i++] = (n % 10) + '0';
+        n /= 10;
+    }
+
+    while (i--) uart_tx(buf[i]);
+}
+
+// ================= DELAY =================
+void delay_ms(unsigned int ms)
+{
+    while (ms--) __delay_cycles(1000);
+}
+
+// ================= ADC =================
+void adc_init(void)
+{
+    ADC10AE0 |= BIT3;      // P1.3
+    ADC10CTL1 = INCH_3;
+    ADC10CTL0 = ADC10SHT_2 | ADC10ON;
+}
+
+unsigned int soil_read(void)
+{
+    ADC10CTL0 |= ENC | ADC10SC;
+    while (ADC10CTL1 & ADC10BUSY);
+    return ADC10MEM;
+}
+
+// ================= CALIBRATION =================
+#define DRY 805
+#define WET 598
+
+// ================= MEDIAN FILTER (3 samples) =================
+unsigned int median3(unsigned int a, unsigned int b, unsigned int c)
+{
+    if (a > b) { unsigned int t=a; a=b; b=t; }
+    if (b > c) { unsigned int t=b; b=c; c=t; }
+    if (a > b) { unsigned int t=a; a=b; b=t; }
+    return b;
+}
+
+// ================= MAIN =================
+int main(void)
+{
+    WDTCTL = WDTPW | WDTHOLD;
+
+    BCSCTL1 = CALBC1_1MHZ;
+    DCOCTL  = CALDCO_1MHZ;
+
+    uart_init();
+    adc_init();
+
+    uart_print("\r\nSoil System with Filters\r\n");
+    uart_print("Collecting 10 samples...\r\n\r\n");
+
+    float ema = 0;        // EMA value
+    float alpha = 0.2;    // 20%
+
+    int i;
+
+    for (i = 1; i <= 10; i++)
+    {
+        // --- take 3 readings for median ---
+        unsigned int r1 = soil_read();
+        delay_ms(50);
+        unsigned int r2 = soil_read();
+        delay_ms(50);
+        unsigned int r3 = soil_read();
+
+        unsigned int median = median3(r1, r2, r3);
+
+        // --- EMA filter ---
+        if (i == 1)
+            ema = median;   // first value initialize
+        else
+            ema = (alpha * median) + ((1 - alpha) * ema);
+
+        // --- convert to % ---
+        int moisture = ((DRY - (int)ema) * 100) / (DRY - WET);
+
+        if (moisture > 100) moisture = 100;
+        if (moisture < 0)   moisture = 0;
+
+        // --- PRINT EVERYTHING ---
+        uart_print("Sample ");
+        uart_print_num(i);
+
+        uart_print(" | Raw=");
+        uart_print_num(r1);
+
+        uart_print(",");
+        uart_print_num(r2);
+
+        uart_print(",");
+        uart_print_num(r3);
+
+        uart_print(" | Median=");
+        uart_print_num(median);
+
+        uart_print(" | EMA=");
+        uart_print_num((int)ema);
+
+        uart_print(" | Moisture=");
+        uart_print_num(moisture);
+        uart_print("%");
+
+        uart_print("\r\n");
+
+        delay_ms(2000);  // 2 seconds between samples
+    }
+
+    uart_print("\r\nDONE\r\n");
+
+    while (1);
+}
