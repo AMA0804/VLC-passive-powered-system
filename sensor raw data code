@@ -1,0 +1,245 @@
+#include <msp430.h>
+#include <stdint.h>
+
+// =====================================================
+// UART
+// =====================================================
+void uart_init(void)
+{
+    P1SEL  |= BIT1 | BIT2;
+    P1SEL2 |= BIT1 | BIT2;
+
+    UCA0CTL1 |= UCSSEL_2;
+    UCA0BR0 = 104;
+    UCA0BR1 = 0;
+    UCA0MCTL = UCBRS0;
+    UCA0CTL1 &= ~UCSWRST;
+}
+
+void uart_tx(char c)
+{
+    while (!(IFG2 & UCA0TXIFG));
+    UCA0TXBUF = c;
+}
+
+void uart_print(char *s)
+{
+    while (*s) uart_tx(*s++);
+}
+
+void uart_num(unsigned int n)
+{
+    char b[6]; int i=0;
+    if(n==0){uart_tx('0'); return;}
+    while(n){b[i++]=n%10+'0'; n/=10;}
+    while(i--) uart_tx(b[i]);
+}
+
+// =====================================================
+// DELAY
+// =====================================================
+void delay_ms(unsigned int ms)
+{
+    while(ms--) __delay_cycles(1000);
+}
+
+// =====================================================
+// SOIL SENSOR (ADC P1.3)
+// =====================================================
+void adc_init(void)
+{
+    ADC10AE0 |= BIT3;
+    ADC10CTL1 = INCH_3;
+    ADC10CTL0 = ADC10SHT_2 | ADC10ON;
+}
+
+unsigned int soil_read(void)
+{
+    ADC10CTL0 |= ENC | ADC10SC;
+    while (ADC10CTL1 & ADC10BUSY);
+    return ADC10MEM;
+}
+
+// =====================================================
+// SOFTWARE I2C (P2.0 SCL, P2.1 SDA)
+// =====================================================
+#define SDA BIT1
+#define SCL BIT0
+
+#define SDA_HIGH() (P2DIR &= ~SDA)
+#define SDA_LOW()  do{P2DIR |= SDA; P2OUT &= ~SDA;}while(0)
+#define SCL_HIGH() (P2DIR &= ~SCL)
+#define SCL_LOW()  do{P2DIR |= SCL; P2OUT &= ~SCL;}while(0)
+#define SDA_READ() (P2IN & SDA)
+
+void i2c_start(void)
+{
+    SDA_HIGH(); SCL_HIGH(); __delay_cycles(5);
+    SDA_LOW();  __delay_cycles(5);
+    SCL_LOW();
+}
+
+void i2c_stop(void)
+{
+    SDA_LOW(); SCL_HIGH(); __delay_cycles(5);
+    SDA_HIGH();
+}
+
+uint8_t i2c_write(uint8_t data)
+{
+    int i;
+    for(i=0;i<8;i++)
+    {
+        if(data & 0x80) SDA_HIGH(); else SDA_LOW();
+        data <<= 1;
+        SCL_HIGH(); __delay_cycles(5);
+        SCL_LOW();
+    }
+
+    SDA_HIGH();
+    SCL_HIGH(); __delay_cycles(5);
+    uint8_t ack = SDA_READ();
+    SCL_LOW();
+
+    return ack;
+}
+
+uint8_t i2c_read(uint8_t ack)
+{
+    uint8_t data=0; int i;
+    SDA_HIGH();
+
+    for(i=0;i<8;i++)
+    {
+        data <<= 1;
+        SCL_HIGH(); __delay_cycles(5);
+        if(SDA_READ()) data |= 1;
+        SCL_LOW();
+    }
+
+    if(ack) SDA_LOW(); else SDA_HIGH();
+
+    SCL_HIGH(); __delay_cycles(5);
+    SCL_LOW();
+    SDA_HIGH();
+
+    return data;
+}
+
+// =====================================================
+// BH1750
+// =====================================================
+#define BH1750_ADDR 0x23
+
+void bh1750_init(void)
+{
+    i2c_start();
+    i2c_write(BH1750_ADDR<<1);
+    i2c_write(0x01);
+    i2c_stop();
+
+    delay_ms(10);
+
+    i2c_start();
+    i2c_write(BH1750_ADDR<<1);
+    i2c_write(0x10);
+    i2c_stop();
+
+    delay_ms(180);
+}
+
+unsigned int bh1750_read(void)
+{
+    uint8_t msb, lsb;
+
+    i2c_start();
+    i2c_write((BH1750_ADDR<<1)|1);
+
+    msb = i2c_read(1);
+    lsb = i2c_read(0);
+
+    i2c_stop();
+
+    return ((msb<<8)|lsb)/1.2;
+}
+
+// =====================================================
+// SHT30
+// =====================================================
+#define SHT30_ADDR 0x44
+
+int sht30_read(int *t_x10, int *h_x10)
+{
+    uint8_t r[6];
+    unsigned int t, h;
+
+    i2c_start();
+    if(i2c_write(SHT30_ADDR<<1)) return -1;
+    i2c_write(0x24);
+    i2c_write(0x00);
+    i2c_stop();
+
+    delay_ms(20);
+
+    i2c_start();
+    if(i2c_write((SHT30_ADDR<<1)|1)) return -2;
+
+    r[0]=i2c_read(1);
+    r[1]=i2c_read(1);
+    r[2]=i2c_read(1);
+    r[3]=i2c_read(1);
+    r[4]=i2c_read(1);
+    r[5]=i2c_read(0);
+
+    i2c_stop();
+
+    t = (r[0]<<8)|r[1];
+    h = (r[3]<<8)|r[4];
+
+    *t_x10 = -450 + ((1750L*t)/65535L);
+    *h_x10 = (1000L*h)/65535L;
+
+    return 0;
+}
+
+// =====================================================
+// MAIN
+// =====================================================
+int main(void)
+{
+    WDTCTL = WDTPW | WDTHOLD;
+
+    BCSCTL1 = CALBC1_1MHZ;
+    DCOCTL  = CALDCO_1MHZ;
+
+    uart_init();
+    adc_init();
+    bh1750_init();
+
+    uart_print("System Ready\r\n");
+
+    while(1)
+    {
+        unsigned int soil = soil_read();
+        unsigned int lux = bh1750_read();
+
+        int t,h;
+        int status = sht30_read(&t,&h);
+
+        uart_print("Soil=");
+        uart_num(soil);
+
+        uart_print(" | Temp=");
+        if(status==0) uart_num(t/10); else uart_print("ERR");
+
+        uart_print(" | Hum=");
+        if(status==0) uart_num(h/10); else uart_print("ERR");
+
+        uart_print(" | Lux=");
+        uart_num(lux);
+
+        uart_print("\r\n");
+
+        delay_ms(2000);
+    }
+}
