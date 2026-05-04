@@ -1,0 +1,183 @@
+#include <msp430.h>
+#include <stdint.h>
+
+// ================= UART =================
+void uart_init(void)
+{
+    P1SEL  |= BIT1 | BIT2;
+    P1SEL2 |= BIT1 | BIT2;
+
+    UCA0CTL1 |= UCSSEL_2;
+    UCA0BR0 = 104;
+    UCA0BR1 = 0;
+    UCA0MCTL = UCBRS0;
+    UCA0CTL1 &= ~UCSWRST;
+}
+
+void uart_tx(char c)
+{
+    while (!(IFG2 & UCA0TXIFG));
+    UCA0TXBUF = c;
+}
+
+void uart_print(const char *s)
+{
+    while (*s) uart_tx(*s++);
+}
+
+void uart_print_num(unsigned int n)
+{
+    char buf[6];
+    int i = 0;
+
+    if (n == 0) { uart_tx('0'); return; }
+
+    while (n)
+    {
+        buf[i++] = (n % 10) + '0';
+        n /= 10;
+    }
+
+    while (i--) uart_tx(buf[i]);
+}
+
+// ================= DELAY =================
+void delay_ms(unsigned int ms)
+{
+    while (ms--) __delay_cycles(1000);
+}
+
+// ================= I2C (P1.6 SCL, P1.7 SDA) =================
+#define SDA BIT7
+#define SCL BIT6
+
+#define SDA_HIGH()  (P1DIR &= ~SDA)
+#define SDA_LOW()   do{P1DIR |= SDA; P1OUT &= ~SDA;}while(0)
+#define SCL_HIGH()  (P1DIR &= ~SCL)
+#define SCL_LOW()   do{P1DIR |= SCL; P1OUT &= ~SCL;}while(0)
+#define SDA_READ()  (P1IN & SDA)
+
+void i2c_start(void)
+{
+    SDA_HIGH(); SCL_HIGH(); __delay_cycles(5);
+    SDA_LOW();  __delay_cycles(5);
+    SCL_LOW();
+}
+
+void i2c_stop(void)
+{
+    SDA_LOW(); SCL_HIGH(); __delay_cycles(5);
+    SDA_HIGH();
+}
+
+void i2c_write(uint8_t data)
+{
+    int i;
+    for (i = 0; i < 8; i++)
+    {
+        if (data & 0x80) SDA_HIGH(); else SDA_LOW();
+        data <<= 1;
+        SCL_HIGH(); __delay_cycles(5);
+        SCL_LOW();
+    }
+    SDA_HIGH();
+    SCL_HIGH(); __delay_cycles(5);
+    SCL_LOW();
+}
+
+uint8_t i2c_read(uint8_t ack)
+{
+    uint8_t data = 0;
+    int i;
+
+    SDA_HIGH();
+
+    for (i = 0; i < 8; i++)
+    {
+        data <<= 1;
+        SCL_HIGH(); __delay_cycles(5);
+        if (SDA_READ()) data |= 1;
+        SCL_LOW();
+    }
+
+    if (ack) SDA_LOW(); else SDA_HIGH();
+
+    SCL_HIGH(); __delay_cycles(5);
+    SCL_LOW();
+    SDA_HIGH();
+
+    return data;
+}
+
+// ================= BH1750 =================
+#define BH1750_ADDR 0x23
+
+void bh1750_init(void)
+{
+    // Power ON
+    i2c_start();
+    i2c_write(BH1750_ADDR << 1);
+    i2c_write(0x01);
+    i2c_stop();
+
+    delay_ms(10);
+
+    // Continuous High Resolution Mode
+    i2c_start();
+    i2c_write(BH1750_ADDR << 1);
+    i2c_write(0x10);
+    i2c_stop();
+
+    delay_ms(180);
+}
+
+unsigned int bh1750_read(void)
+{
+    uint8_t msb, lsb;
+
+    i2c_start();
+    i2c_write((BH1750_ADDR << 1) | 1);
+
+    msb = i2c_read(1);
+    lsb = i2c_read(0);
+
+    i2c_stop();
+
+    return ((msb << 8) | lsb) / 1.2;
+}
+
+// ================= MAIN =================
+int main(void)
+{
+    WDTCTL = WDTPW | WDTHOLD;
+
+    // Clock 1MHz
+    BCSCTL1 = CALBC1_1MHZ;
+    DCOCTL  = CALDCO_1MHZ;
+
+    uart_init();
+    bh1750_init();
+
+    uart_print("\r\nBH1750 Calibration Mode\r\n");
+    uart_print("Collecting 30 samples...\r\n\r\n");
+
+    int i;
+
+    for (i = 1; i <= 30; i++)
+    {
+        unsigned int lux = bh1750_read();
+
+        uart_print("Sample ");
+        uart_print_num(i);
+
+        uart_print(" : Lux = ");
+        uart_print_num(lux);
+        uart_print(" lx\r\n");
+
+        delay_ms(2000); // 2 seconds
+    }
+
+    uart_print("\r\nDONE\r\n");
+
+    while (1);
+}
