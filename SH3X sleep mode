@@ -1,0 +1,206 @@
+#include <msp430.h>
+#include <stdint.h>
+
+// ================= MOSFET CONTROL =================
+#define SHT_PWR BIT2   // P1.2
+
+// ================= UART =================
+void uart_init(void)
+{
+    P1SEL  |= BIT1 | BIT2;
+    P1SEL2 |= BIT1 | BIT2;
+
+    UCA0CTL1 |= UCSSEL_2;
+    UCA0BR0 = 104;
+    UCA0BR1 = 0;
+    UCA0MCTL = UCBRS0;
+    UCA0CTL1 &= ~UCSWRST;
+}
+
+void uart_tx(char c)
+{
+    while (!(IFG2 & UCA0TXIFG));
+    UCA0TXBUF = c;
+}
+
+void uart_print(const char *s)
+{
+    while (*s) uart_tx(*s++);
+}
+
+void uart_print_num(int n)
+{
+    char buf[10];
+    int i = 0;
+
+    if (n == 0) { uart_tx('0'); return; }
+
+    if (n < 0) { uart_tx('-'); n = -n; }
+
+    while (n)
+    {
+        buf[i++] = (n % 10) + '0';
+        n /= 10;
+    }
+
+    while (i--) uart_tx(buf[i]);
+}
+
+// ================= DELAY =================
+void delay_ms(unsigned int ms)
+{
+    while (ms--) __delay_cycles(1000);
+}
+
+// ================= I2C =================
+#define SDA BIT7
+#define SCL BIT6
+
+#define SDA_HIGH()  (P1DIR &= ~SDA)
+#define SDA_LOW()   do{P1DIR |= SDA; P1OUT &= ~SDA;}while(0)
+#define SCL_HIGH()  (P1DIR &= ~SCL)
+#define SCL_LOW()   do{P1DIR |= SCL; P1OUT &= ~SCL;}while(0)
+#define SDA_READ()  (P1IN & SDA)
+
+void i2c_start(void)
+{
+    SDA_HIGH(); SCL_HIGH(); __delay_cycles(5);
+    SDA_LOW();  __delay_cycles(5);
+    SCL_LOW();
+}
+
+void i2c_stop(void)
+{
+    SDA_LOW(); SCL_HIGH(); __delay_cycles(5);
+    SDA_HIGH();
+}
+
+void i2c_write(uint8_t data)
+{
+    int i;
+    for (i = 0; i < 8; i++)
+    {
+        if (data & 0x80) SDA_HIGH(); else SDA_LOW();
+        data <<= 1;
+        SCL_HIGH(); __delay_cycles(5);
+        SCL_LOW();
+    }
+
+    SDA_HIGH();
+    SCL_HIGH(); __delay_cycles(5);
+    SCL_LOW();
+}
+
+uint8_t i2c_read(uint8_t ack)
+{
+    uint8_t data = 0;
+    int i;
+
+    SDA_HIGH();
+
+    for (i = 0; i < 8; i++)
+    {
+        data <<= 1;
+        SCL_HIGH(); __delay_cycles(5);
+        if (SDA_READ()) data |= 1;
+        SCL_LOW();
+    }
+
+    if (ack) SDA_LOW(); else SDA_HIGH();
+
+    SCL_HIGH(); __delay_cycles(5);
+    SCL_LOW();
+    SDA_HIGH();
+
+    return data;
+}
+
+// ================= SHT3x =================
+#define SHT3X_ADDR 0x44
+
+void sht3x_init(void)
+{
+    i2c_start();
+    i2c_write(SHT3X_ADDR << 1);
+    i2c_write(0x2C);
+    i2c_write(0x06);
+    i2c_stop();
+
+    delay_ms(20);
+}
+
+void sht3x_read(int *temp, int *hum)
+{
+    uint8_t msb_t, lsb_t;
+    uint8_t msb_h, lsb_h;
+
+    i2c_start();
+    i2c_write((SHT3X_ADDR << 1) | 1);
+
+    msb_t = i2c_read(1);
+    lsb_t = i2c_read(1);
+    i2c_read(1); // skip CRC
+
+    msb_h = i2c_read(1);
+    lsb_h = i2c_read(0);
+    i2c_read(0); // skip CRC
+
+    i2c_stop();
+
+    uint16_t raw_temp = (msb_t << 8) | lsb_t;
+    uint16_t raw_hum  = (msb_h << 8) | lsb_h;
+
+    *temp = (int)(-45 + (175.0 * raw_temp / 65535.0));
+    *hum  = (int)(100.0 * raw_hum / 65535.0);
+}
+
+// ================= MAIN =================
+int main(void)
+{
+    WDTCTL = WDTPW | WDTHOLD;
+
+    BCSCTL1 = CALBC1_1MHZ;
+    DCOCTL  = CALDCO_1MHZ;
+
+    uart_init();
+
+    // MOSFET setup
+    P1DIR |= SHT_PWR;
+    P1OUT &= ~SHT_PWR;
+
+    uart_print("\r\nSHT3x Low Power System\r\n");
+
+    int temp, hum;
+
+    // ================= POWER ON SENSOR =================
+    P1OUT |= SHT_PWR;
+    delay_ms(500);
+
+    sht3x_init();
+    sht3x_read(&temp, &hum);
+
+    uart_print("\r\nTemperature = ");
+    uart_print_num(temp);
+    uart_print(" C");
+
+    uart_print("\r\nHumidity = ");
+    uart_print_num(hum);
+    uart_print(" %\r\n");
+
+    // ================= POWER OFF SENSOR =================
+    P1OUT &= ~SHT_PWR;
+
+    uart_print("\r\nSensor OFF\r\n");
+
+    delay_ms(100);
+
+    uart_print("\r\nEntering LPM3 Sleep Mode...\r\n");
+
+    // disable UART for low power
+    UCA0CTL1 |= UCSWRST;
+
+    // ================= SLEEP =================
+    __bis_SR_register(LPM3_bits + GIE);
+
+    while (1);
+}
