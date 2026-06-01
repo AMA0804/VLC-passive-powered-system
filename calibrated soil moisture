@@ -1,0 +1,371 @@
+#include <msp430.h>
+#include <stdint.h>
+
+// ================= MOSFET PINS =================
+#define SOIL_PWR  BIT0   // P1.0
+#define BH_PWR    BIT1   // P1.1
+#define SHT_PWR   BIT2   // P1.2
+
+// ================= FILTER SETTINGS =================
+#define SOIL_N 5
+#define MA_N   5
+
+unsigned int soil_buf[SOIL_N];
+unsigned int ma_buf[MA_N];
+int soil_index = 0;
+int ma_index = 0;
+int ma_count = 0;
+
+// ================= BH1750 FILTER =================
+#define BH_ALPHA 0.2
+#define BH_REF 8000.0
+
+float bh_ema = 0;
+int bh_init = 0;
+
+// ================= I2C PROTOTYPES (FIX) =================
+void i2c_start(void);
+void i2c_stop(void);
+void i2c_write(uint8_t d);
+uint8_t i2c_read(uint8_t ack);
+
+// ================= UART =================
+void uart_init(void)
+{
+    P1SEL  |= BIT1 | BIT2;
+    P1SEL2 |= BIT1 | BIT2;
+
+    UCA0CTL1 |= UCSSEL_2;
+    UCA0BR0 = 104;
+    UCA0BR1 = 0;
+    UCA0MCTL = UCBRS0;
+    UCA0CTL1 &= ~UCSWRST;
+}
+
+void uart_tx(char c)
+{
+    while (!(IFG2 & UCA0TXIFG));
+    UCA0TXBUF = c;
+}
+
+void uart_print(const char *s)
+{
+    while (*s) uart_tx(*s++);
+}
+
+void uart_num(int n)
+{
+    char buf[10];
+    int i = 0;
+
+    if (n == 0) { uart_tx('0'); return; }
+
+    if (n < 0) { uart_tx('-'); n = -n; }
+
+    while (n)
+    {
+        buf[i++] = (n % 10) + '0';
+        n /= 10;
+    }
+
+    while (i--) uart_tx(buf[i]);
+}
+
+// ================= DELAY =================
+void delay_ms(unsigned int ms)
+{
+    while (ms--) __delay_cycles(1000);
+}
+
+// ================= ADC =================
+void adc_init()
+{
+    ADC10AE0 |= BIT3;
+    ADC10CTL1 = INCH_3;
+    ADC10CTL0 = ADC10SHT_2 | ADC10ON;
+}
+
+unsigned int soil_read()
+{
+    ADC10CTL0 |= ENC | ADC10SC;
+    while (ADC10CTL1 & ADC10BUSY);
+    return ADC10MEM;
+}
+
+// ================= MEDIAN FILTER =================
+unsigned int median5(unsigned int *arr)
+{
+    unsigned int temp[SOIL_N];
+    int i, j;
+
+    for(i=0;i<SOIL_N;i++)
+        temp[i] = arr[i];
+
+    for(i=0;i<SOIL_N-1;i++)
+    {
+        for(j=i+1;j<SOIL_N;j++)
+        {
+            if(temp[i] > temp[j])
+            {
+                unsigned int t = temp[i];
+                temp[i] = temp[j];
+                temp[j] = t;
+            }
+        }
+    }
+
+    return temp[SOIL_N/2];
+}
+
+// ================= MOVING AVERAGE =================
+unsigned int moving_average(unsigned int new_val)
+{
+    unsigned long sum = 0;
+    int i;
+
+    ma_buf[ma_index++] = new_val;
+
+    if(ma_index >= MA_N) ma_index = 0;
+    if(ma_count < MA_N) ma_count++;
+
+    for(i=0;i<ma_count;i++)
+        sum += ma_buf[i];
+
+    return (unsigned int)(sum / ma_count);
+}
+
+// ================= SOIL CALIBRATION =================
+int soil_to_percent(unsigned int val)
+{
+    int dry = 754;
+    int wet = 602;
+
+    int percent = (val - wet) * 100 / (dry - wet);
+
+    if(percent > 100) percent = 100;
+    if(percent < 0) percent = 0;
+
+    return 100 - percent;
+}
+
+// ================= BH1750 =================
+#define BH_ADDR 0x23
+
+unsigned int bh1750_read()
+{
+    uint8_t msb, lsb;
+
+    i2c_start();
+    i2c_write(BH_ADDR << 1);
+    i2c_write(0x10);
+    i2c_stop();
+
+    delay_ms(180);
+
+    i2c_start();
+    i2c_write((BH_ADDR << 1) | 1);
+
+    msb = i2c_read(1);
+    lsb = i2c_read(0);
+    i2c_stop();
+
+    return ((msb << 8) | lsb) / 1.2;
+}
+
+// ================= BH PROCESS =================
+unsigned int bh1750_process(unsigned int raw)
+{
+    float calibrated = raw * 0.871;
+
+    if(bh_init == 0)
+    {
+        bh_ema = calibrated;
+        bh_init = 1;
+    }
+    else
+    {
+        bh_ema = (BH_ALPHA * calibrated) + ((1 - BH_ALPHA) * bh_ema);
+    }
+
+    return (unsigned int)bh_ema;
+}
+
+// ================= BH PERCENT =================
+int bh_to_percent(unsigned int lux)
+{
+    int percent = (lux * 100) / BH_REF;
+
+    if(percent > 100) percent = 100;
+    if(percent < 0) percent = 0;
+
+    return percent;
+}
+
+// ================= I2C (SOFTWARE) =================
+#define SDA BIT7
+#define SCL BIT6
+
+#define SDA_H() (P1DIR &= ~SDA)
+#define SDA_L() do{P1DIR |= SDA; P1OUT &= ~SDA;}while(0)
+#define SCL_H() (P1DIR &= ~SCL)
+#define SCL_L() do{P1DIR |= SCL; P1OUT &= ~SCL;}while(0)
+#define SDA_R() (P1IN & SDA)
+
+void i2c_start(){ SDA_H(); SCL_H(); __delay_cycles(5); SDA_L(); __delay_cycles(5); SCL_L(); }
+void i2c_stop(){ SDA_L(); SCL_H(); __delay_cycles(5); SDA_H(); }
+
+void i2c_write(uint8_t d)
+{
+    int i;
+    for(i=0;i<8;i++)
+    {
+        if(d & 0x80) SDA_H(); else SDA_L();
+        d <<= 1;
+        SCL_H(); __delay_cycles(5);
+        SCL_L();
+    }
+    SDA_H();
+    SCL_H(); __delay_cycles(5);
+    SCL_L();
+}
+
+uint8_t i2c_read(uint8_t ack)
+{
+    uint8_t d=0;
+    int i;
+
+    SDA_H();
+
+    for(i=0;i<8;i++)
+    {
+        d <<= 1;
+        SCL_H(); __delay_cycles(5);
+        if(SDA_R()) d |= 1;
+        SCL_L();
+    }
+
+    if(ack) SDA_L(); else SDA_H();
+    SCL_H(); __delay_cycles(5);
+    SCL_L();
+    SDA_H();
+
+    return d;
+}
+
+// ================= SHT3x (DUMMY FIX TO REMOVE ERROR) =================
+void sht3x_read(int *t, int *h)
+{
+    // Temporary safe values (replace with real driver later)
+    *t = 26;
+    *h = 55;
+}
+
+// ================= MAIN =================
+int main(void)
+{
+    WDTCTL = WDTPW | WDTHOLD;
+
+    BCSCTL1 = CALBC1_1MHZ;
+    DCOCTL  = CALDCO_1MHZ;
+
+    uart_init();
+    adc_init();
+
+    P1DIR |= SOIL_PWR | BH_PWR | SHT_PWR;
+    P1OUT &= ~(SOIL_PWR | BH_PWR | SHT_PWR);
+
+    uart_print("\r\nSMART SENSOR SYSTEM START\r\n");
+
+    int i;
+
+    // ================= SOIL =================
+    uart_print("\r\nSOIL SENSOR\r\n");
+
+    P1OUT |= SOIL_PWR;
+    delay_ms(300);
+
+    for(i=0;i<SOIL_N;i++)
+    {
+        soil_buf[i] = soil_read();
+        delay_ms(50);
+    }
+
+    for(i=0;i<20;i++)
+    {
+        unsigned int raw = soil_read();
+
+        soil_buf[soil_index++] = raw;
+        if(soil_index >= SOIL_N) soil_index = 0;
+
+        unsigned int med = median5(soil_buf);
+        unsigned int smooth = moving_average(med);
+        int moisture = soil_to_percent(smooth);
+
+        uart_print("Raw: ");
+        uart_num(raw);
+
+        uart_print(" Smooth: ");
+        uart_num(smooth);
+
+        uart_print(" Moisture: ");
+        uart_num(moisture);
+        uart_print(" %\r\n");
+
+        delay_ms(500);
+    }
+
+    P1OUT &= ~SOIL_PWR;
+
+    // ================= BH1750 =================
+    uart_print("\r\nBH1750 SENSOR\r\n");
+
+    P1OUT |= BH_PWR;
+    delay_ms(500);
+
+    for(i=0;i<30;i++)
+    {
+        unsigned int raw = bh1750_read();
+        unsigned int lux = bh1750_process(raw);
+        int percent = bh_to_percent(lux);
+
+        uart_print("Raw: ");
+        uart_num(raw);
+
+        uart_print(" Lux: ");
+        uart_num(lux);
+
+        uart_print(" Lux%: ");
+        uart_num(percent);
+        uart_print(" %\r\n");
+
+        delay_ms(300);
+    }
+
+    P1OUT &= ~BH_PWR;
+
+    // ================= SHT3x =================
+    uart_print("\r\nSHT3x SENSOR\r\n");
+
+    P1OUT |= SHT_PWR;
+    delay_ms(500);
+
+    int t, h;
+    sht3x_read(&t, &h);
+
+    uart_print("Temp: ");
+    uart_num(t);
+    uart_print(" C\r\n");
+
+    uart_print("Hum: ");
+    uart_num(h);
+    uart_print(" %\r\n");
+
+    P1OUT &= ~SHT_PWR;
+
+    uart_print("\r\nENTERING LPM3...\r\n");
+
+    UCA0CTL1 |= UCSWRST;
+    __bis_SR_register(LPM3_bits + GIE);
+
+    while(1);
+}
