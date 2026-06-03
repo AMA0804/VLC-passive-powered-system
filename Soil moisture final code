@@ -1,0 +1,365 @@
+#include <msp430.h>
+#include <stdint.h>
+
+/* ================= PIN DEFINITIONS ================= */
+
+#define SOIL_MOSFET        BIT0    // P1.0 -> BSS138 gate
+#define SOIL_ADC_BIT       BIT3    // P1.3 / A3
+#define SOIL_ADC_CHANNEL   INCH_3  // ADC channel A3
+
+/* ================= SOIL CALIBRATION ================= */
+
+/*
+   Your measured values:
+
+   Dry soil:
+   Mostly 804 - 806
+   Min 793, Max 814
+   Selected dry calibration value = 805
+
+   Wet soil:
+   Mostly around 598 - 611
+   Min 593, Max 611
+   Selected wet calibration value = 602
+
+   Dry ADC = 0.0% moisture
+   Wet ADC = 100.0% moisture
+*/
+
+#define SOIL_DRY_ADC       805
+#define SOIL_WET_ADC       602
+
+/* ================= FILTER SETTINGS ================= */
+
+/*
+   EMA alpha = 0.2
+   final = old + 0.2 * (new - old)
+*/
+
+#define SOIL_EMA_ALPHA_NUM  2
+#define SOIL_EMA_ALPHA_DEN  10
+
+/* ================= DELAY ================= */
+
+void delay_ms(uint16_t ms)
+{
+    while (ms--)
+    {
+        __delay_cycles(1000);   // 1 MHz clock
+    }
+}
+
+/* ================= CLOCK ================= */
+
+void clock_init(void)
+{
+    if (CALBC1_1MHZ != 0xFF)
+    {
+        DCOCTL = 0;
+        BCSCTL1 = CALBC1_1MHZ;
+        DCOCTL = CALDCO_1MHZ;
+    }
+}
+
+/* ================= UART ================= */
+
+void uart_init(void)
+{
+    P1SEL  |= BIT1 | BIT2;
+    P1SEL2 |= BIT1 | BIT2;
+
+    UCA0CTL1 |= UCSWRST;
+    UCA0CTL1 |= UCSSEL_2;      // SMCLK
+
+    UCA0BR0 = 104;             // 9600 baud at 1 MHz
+    UCA0BR1 = 0;
+    UCA0MCTL = UCBRS0;
+
+    UCA0CTL1 &= ~UCSWRST;
+}
+
+void uart_putc(char c)
+{
+    while (!(IFG2 & UCA0TXIFG));
+    UCA0TXBUF = c;
+}
+
+void uart_puts(const char *s)
+{
+    while (*s)
+    {
+        uart_putc(*s++);
+    }
+}
+
+void uart_print_uint32(uint32_t value)
+{
+    char buffer[11];
+    uint8_t i = 0;
+
+    if (value == 0)
+    {
+        uart_putc('0');
+        return;
+    }
+
+    while (value > 0)
+    {
+        buffer[i++] = (value % 10) + '0';
+        value /= 10;
+    }
+
+    while (i > 0)
+    {
+        uart_putc(buffer[--i]);
+    }
+}
+
+void uart_print_percent_x10(uint32_t value_x10)
+{
+    uart_print_uint32(value_x10 / 10);
+    uart_putc('.');
+    uart_print_uint32(value_x10 % 10);
+}
+
+/* ================= SOIL SENSOR MOSFET CONTROL ================= */
+
+void soil_power_init(void)
+{
+    P1SEL  &= ~SOIL_MOSFET;
+    P1SEL2 &= ~SOIL_MOSFET;
+
+    P1OUT &= ~SOIL_MOSFET;     // MOSFET OFF first
+    P1DIR |= SOIL_MOSFET;      // P1.0 output
+}
+
+void soil_power_on(void)
+{
+    P1OUT |= SOIL_MOSFET;      // Gate HIGH -> BSS138 ON
+}
+
+void soil_power_off(void)
+{
+    P1OUT &= ~SOIL_MOSFET;     // Gate LOW -> BSS138 OFF
+}
+
+/* ================= ADC ================= */
+
+void adc_init(void)
+{
+    ADC10CTL0 &= ~ENC;
+
+    ADC10CTL1 = SOIL_ADC_CHANNEL;          // P1.3 / A3
+    ADC10CTL0 = SREF_0 | ADC10SHT_2 | ADC10ON;
+
+    ADC10AE0 |= SOIL_ADC_BIT;              // Enable analog input P1.3
+}
+
+uint16_t adc_read_once(void)
+{
+    ADC10CTL0 |= ENC | ADC10SC;
+
+    while (ADC10CTL1 & ADC10BUSY);
+
+    ADC10CTL0 &= ~ENC;
+
+    return ADC10MEM;
+}
+
+/* ================= RAW ADC FILTER ================= */
+
+uint16_t read_soil_adc_filtered(void)
+{
+    uint8_t i;
+    uint16_t adc_value;
+    uint16_t min_value = 1023;
+    uint16_t max_value = 0;
+    uint32_t sum = 0;
+
+    /*
+       Discard first few ADC readings after sensor power ON.
+       This helps because analog output needs settling time.
+    */
+
+    for (i = 0; i < 5; i++)
+    {
+        adc_read_once();
+        delay_ms(5);
+    }
+
+    /*
+       Take 15 readings.
+       Remove minimum and maximum.
+       Average remaining 13 readings.
+    */
+
+    for (i = 0; i < 15; i++)
+    {
+        adc_value = adc_read_once();
+
+        sum += adc_value;
+
+        if (adc_value < min_value)
+        {
+            min_value = adc_value;
+        }
+
+        if (adc_value > max_value)
+        {
+            max_value = adc_value;
+        }
+
+        delay_ms(10);
+    }
+
+    sum = sum - min_value - max_value;
+
+    return (uint16_t)(sum / 13);
+}
+
+/* ================= SOIL CALIBRATION ================= */
+
+uint32_t calibrate_soil_moisture_x10(uint16_t adc_value)
+{
+    int32_t moisture_x10;
+
+    /*
+       Dry soil = 0.0%
+       Wet soil = 100.0%
+
+       Your sensor:
+       Dry ADC is high.
+       Wet ADC is low.
+
+       moisture = (dry_adc - current_adc) / (dry_adc - wet_adc)
+    */
+
+    moisture_x10 = ((int32_t)(SOIL_DRY_ADC - adc_value) * 1000) /
+                   (SOIL_DRY_ADC - SOIL_WET_ADC);
+
+    if (moisture_x10 < 0)
+    {
+        moisture_x10 = 0;
+    }
+
+    if (moisture_x10 > 1000)
+    {
+        moisture_x10 = 1000;
+    }
+
+    return (uint32_t)moisture_x10;
+}
+
+/* ================= EMA FILTER ================= */
+
+uint32_t ema_filter_soil_x10(uint32_t new_moisture_x10)
+{
+    static uint8_t first_run = 1;
+    static int32_t filtered_moisture_x10 = 0;
+    int32_t error;
+
+    if (first_run)
+    {
+        filtered_moisture_x10 = (int32_t)new_moisture_x10;
+        first_run = 0;
+    }
+    else
+    {
+        error = (int32_t)new_moisture_x10 - filtered_moisture_x10;
+
+        filtered_moisture_x10 = filtered_moisture_x10 +
+                                ((SOIL_EMA_ALPHA_NUM * error) /
+                                 SOIL_EMA_ALPHA_DEN);
+    }
+
+    if (filtered_moisture_x10 < 0)
+    {
+        filtered_moisture_x10 = 0;
+    }
+
+    if (filtered_moisture_x10 > 1000)
+    {
+        filtered_moisture_x10 = 1000;
+    }
+
+    return (uint32_t)filtered_moisture_x10;
+}
+
+/* ================= FINAL SOIL SENSOR READ ================= */
+
+uint8_t soil_read_final(uint16_t *raw_adc,
+                        uint32_t *calibrated_moisture_x10,
+                        uint32_t *final_moisture_x10)
+{
+    uint16_t adc_filtered;
+    uint32_t moisture_calibrated;
+
+    soil_power_on();
+
+    // Wait for capacitive soil sensor output to stabilize
+    delay_ms(800);
+
+    adc_filtered = read_soil_adc_filtered();
+
+    moisture_calibrated = calibrate_soil_moisture_x10(adc_filtered);
+
+    *raw_adc = adc_filtered;
+    *calibrated_moisture_x10 = moisture_calibrated;
+    *final_moisture_x10 = ema_filter_soil_x10(moisture_calibrated);
+
+    soil_power_off();
+
+    return 1;
+}
+
+/* ================= MAIN ================= */
+
+int main(void)
+{
+    uint16_t raw_adc;
+    uint32_t calibrated_moisture_x10;
+    uint32_t final_moisture_x10;
+
+    WDTCTL = WDTPW | WDTHOLD;
+
+    clock_init();
+    uart_init();
+    adc_init();
+    soil_power_init();
+
+    soil_power_off();
+
+    uart_puts("\r\nCapacitive Soil Moisture Sensor Test Started\r\n");
+    uart_puts("MOSFET Gate = P1.0\r\n");
+    uart_puts("ADC Input = P1.3 / A3\r\n");
+    uart_puts("Dry ADC = 805 -> 0.0%\r\n");
+    uart_puts("Wet ADC = 602 -> 100.0%\r\n");
+    uart_puts("Filter = ADC trimmed mean + EMA\r\n");
+
+    while (1)
+    {
+        uart_puts("\r\n-----------------------------\r\n");
+
+        uart_puts("Soil sensor ON\r\n");
+
+        soil_read_final(&raw_adc,
+                        &calibrated_moisture_x10,
+                        &final_moisture_x10);
+
+        uart_puts("Raw filtered ADC = ");
+        uart_print_uint32(raw_adc);
+        uart_puts("\r\n");
+
+        uart_puts("Calibrated moisture = ");
+        uart_print_percent_x10(calibrated_moisture_x10);
+        uart_puts(" %\r\n");
+
+        uart_puts("Final soil moisture = ");
+        uart_print_percent_x10(final_moisture_x10);
+        uart_puts(" %\r\n");
+
+        uart_puts("Soil sensor OFF\r\n");
+
+        delay_ms(3000);
+    }
+}
