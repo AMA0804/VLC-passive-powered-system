@@ -1,0 +1,2138 @@
+#include <msp430.h>
+#include <stdint.h>
+
+/* ============================================================
+   FINAL 4-SENSOR SEQUENCING SYSTEM
+
+   Sequence:
+   1. Soil moisture sensor ON  -> Read -> Filter -> Calibrate -> OFF
+   2. BH1750 light sensor ON   -> Read -> Filter -> Calibrate -> OFF
+   3. SHT3X sensor ON          -> Read -> Filter -> OFF
+   4. DS18B20 sensor always ON -> Read -> Average filter
+   5. Send 64-bit NEC-style IR status packet as 3 identical bursts to grow light
+
+   MCU assumed: MSP430G2553 / MSP430 LaunchPad
+   Clock: 1 MHz
+   UART TX only: P1.2, 9600 baud
+   ============================================================ */
+
+/* ================= FINAL PIN DEFINITIONS ================= */
+
+#define SOIL_MOSFET        BIT4    // P1.4 -> Soil sensor BSS138 gate
+#define BH1750_MOSFET      BIT4    // P2.4 -> BH1750 BSS138 gate
+#define SHT3X_MOSFET       BIT5    // P2.5 -> SHT3X BSS138 gate
+
+#define SOIL_ADC_BIT       BIT3    // P1.3 / A3
+#define SOIL_ADC_CHANNEL   INCH_3
+
+#define UART_TX_PIN        BIT2    // P1.2 TX only
+
+#define I2C_SCL            BIT6    // P1.6
+#define I2C_SDA            BIT7    // P1.7
+
+/* IR uplink transmitter to grow light.
+   P1.5 drives IR LED through a transistor/MOSFET driver. */
+#define IR_TX_PIN          BIT5    // P1.5 -> IR TX LED driver input
+
+/* DS18B20 is always powered. DATA pin changed to P1.1.
+   Use external 4.7k pull-up from DATA to 3.3V. */
+#define DS18B20_PIN        BIT1    // P1.1 -> DS18B20 DATA
+#define DS18B20_DIR        P1DIR
+#define DS18B20_OUT        P1OUT
+#define DS18B20_IN         P1IN
+#define DS18B20_SEL        P1SEL
+#define DS18B20_SEL2       P1SEL2
+#define DS18B20_REN        P1REN
+
+#define BH1750_ADDR_1      0x23
+#define BH1750_ADDR_2      0x5C
+
+#define SHT3X_ADDR_1       0x44
+#define SHT3X_ADDR_2       0x45
+
+#define I2C_TIMEOUT        60000
+
+/* ================= SOIL CALIBRATION ================= */
+
+#define SOIL_DRY_ADC       805     // Dry soil = 0.0%
+#define SOIL_WET_ADC       602     // Wet soil = 100.0%
+
+/* ================= FILTER SETTINGS ================= */
+
+#define EMA_ALPHA_NUM      2       // alpha = 0.2
+#define EMA_ALPHA_DEN      10
+
+#define DS18B20_FILTER_SAMPLES       5
+#define DS18B20_CAL_OFFSET_X100      0
+#define DS18B20_ERROR_VALUE_X100    -99900
+
+
+/* ================= SAFFRON EDGE COMPUTING THRESHOLDS =================
+   Decision-only mode. This code prints local decisions only.
+   It does NOT control actuators yet.
+
+   Units:
+   - Soil moisture: x10 percentage      25.0% = 250
+   - Air temperature: x10 Celsius       25.0 C = 250
+   - Humidity: x10 percentage RH        80.0% = 800
+   - DS18B20 soil/corm temperature: x100 18.00 C = 1800
+   - BH1750 light: x10 lux              5000.0 lx = 50000
+   ============================================================ */
+
+/* Saffron prefers lower moisture than strawberry.
+   Your soil scale: dry soil = 0%, wet soil = 100%. */
+#define SOIL_LOW_X10              250    // below 25.0% -> irrigation needed
+#define SOIL_OK_X10               350    // 35.0% or above -> OK
+#define SOIL_HIGH_X10             450    // above 45.0% -> too wet warning
+
+/* Air temperature from SHT3X */
+#define AIR_TEMP_HIGH_X10         250    // above 25.0 C -> cooling/fan needed
+#define AIR_TEMP_SAFE_X10         230    // below 23.0 C -> safe/off threshold
+#define AIR_TEMP_LOW_X10          150    // below 15.0 C -> low temperature warning
+
+/* Relative humidity from SHT3X */
+#define RH_LOW_X10                600    // below 60.0% RH -> low humidity warning
+#define RH_HIGH_X10               800    // above 80.0% RH -> high humidity warning
+#define RH_SAFE_X10               750    // below 75.0% RH -> safe/off threshold
+
+/* Soil/corm temperature from DS18B20 */
+#define SOIL_TEMP_HIGH_X100       1800   // above 18.00 C -> corm zone too warm
+#define SOIL_TEMP_SAFE_X100       1600   // below 16.00 C -> safe/off threshold
+#define SOIL_TEMP_LOW_X100        1000   // below 10.00 C -> low temperature warning
+
+/* BH1750 lux, monitor-only rough threshold */
+#define LIGHT_LOW_LUX_X10         50000  // below 5000.0 lux -> low light
+#define LIGHT_OK_LUX_X10          80000  // 8000.0 lux or above -> good monitor level
+
+/* ================= LPM3 SLEEP SETTINGS ================= */
+
+#define ACLK_FREQ_HZ              12000UL // VLO approx. 12 kHz, not exact
+#define SLEEP_SECONDS             300     // 5 minutes = 300 seconds
+
+volatile uint16_t sleep_counter = 0;
+
+/* ================= DELAY ================= */
+
+void delay_ms(uint16_t ms)
+{
+    while (ms--)
+    {
+        __delay_cycles(1000);       // 1 MHz clock
+    }
+}
+
+/* ================= CLOCK ================= */
+
+void clock_init(void)
+{
+    if (CALBC1_1MHZ == 0xFF)
+    {
+        while (1);
+    }
+
+    DCOCTL = 0;
+    BCSCTL1 = CALBC1_1MHZ;
+    DCOCTL = CALDCO_1MHZ;
+}
+
+/* ================= UART TX ONLY ================= */
+
+void uart_init(void)
+{
+    /*
+       UART TX only is used on P1.2.
+       BH1750 MOSFET gate is on P2.4.
+       SHT3X MOSFET gate is on P2.5.
+    */
+
+    P1SEL  |= UART_TX_PIN;
+    P1SEL2 |= UART_TX_PIN;
+
+    UCA0CTL1 |= UCSWRST;
+    UCA0CTL1 |= UCSSEL_2;
+
+    UCA0BR0 = 104;     // 9600 baud @ 1 MHz
+    UCA0BR1 = 0;
+    UCA0MCTL = UCBRS0;
+
+    UCA0CTL1 &= ~UCSWRST;
+}
+
+void uart_putc(char c)
+{
+    while (!(IFG2 & UCA0TXIFG));
+    UCA0TXBUF = c;
+}
+
+void uart_puts(const char *s)
+{
+    while (*s)
+    {
+        uart_putc(*s++);
+    }
+}
+
+void uart_print_uint32(uint32_t value)
+{
+    char buffer[11];
+    uint8_t i = 0;
+
+    if (value == 0)
+    {
+        uart_putc('0');
+        return;
+    }
+
+    while (value > 0)
+    {
+        buffer[i++] = (value % 10) + '0';
+        value /= 10;
+    }
+
+    while (i > 0)
+    {
+        uart_putc(buffer[--i]);
+    }
+}
+
+void uart_print_int32(int32_t value)
+{
+    if (value < 0)
+    {
+        uart_putc('-');
+        value = -value;
+    }
+
+    uart_print_uint32((uint32_t)value);
+}
+
+void uart_print_int_x10(int32_t value_x10)
+{
+    if (value_x10 < 0)
+    {
+        uart_putc('-');
+        value_x10 = -value_x10;
+    }
+
+    uart_print_uint32((uint32_t)(value_x10 / 10));
+    uart_putc('.');
+    uart_print_uint32((uint32_t)(value_x10 % 10));
+}
+
+void uart_print_uint_x10(uint32_t value_x10)
+{
+    uart_print_uint32(value_x10 / 10);
+    uart_putc('.');
+    uart_print_uint32(value_x10 % 10);
+}
+
+void uart_print_temp_x100(int32_t temp_x100)
+{
+    int32_t abs_temp;
+
+    if (temp_x100 < 0)
+    {
+        uart_putc('-');
+        abs_temp = -temp_x100;
+    }
+    else
+    {
+        abs_temp = temp_x100;
+    }
+
+    uart_print_uint32((uint32_t)(abs_temp / 100));
+    uart_putc('.');
+
+    if ((abs_temp % 100) < 10)
+    {
+        uart_putc('0');
+    }
+
+    uart_print_uint32((uint32_t)(abs_temp % 100));
+}
+
+
+/* ================= EDGE COMPUTING DECISION PART ================= */
+
+void edge_compute_print_decisions(uint32_t soil_moisture_x10,
+                                  uint32_t light_lux_x10,
+                                  int32_t air_temp_x10,
+                                  uint32_t air_hum_x10,
+                                  int32_t soil_temp_x100)
+{
+    uart_puts("\r\n---------- SAFFRON EDGE DECISION ----------\r\n");
+
+    /* ---------- Soil moisture ---------- */
+
+    uart_puts("Soil moisture = ");
+    uart_print_uint_x10(soil_moisture_x10);
+    uart_puts(" % -> ");
+
+    if (soil_moisture_x10 < SOIL_LOW_X10)
+    {
+        uart_puts("LOW, irrigation needed\r\n");
+    }
+    else if (soil_moisture_x10 > SOIL_HIGH_X10)
+    {
+        uart_puts("TOO WET, stop irrigation / rot risk\r\n");
+    }
+    else if (soil_moisture_x10 >= SOIL_OK_X10)
+    {
+        uart_puts("OK for saffron\r\n");
+    }
+    else
+    {
+        uart_puts("SLIGHTLY DRY, monitor\r\n");
+    }
+
+    /* ---------- Air temperature ---------- */
+
+    uart_puts("Air temperature = ");
+    uart_print_int_x10(air_temp_x10);
+    uart_puts(" C -> ");
+
+    if (air_temp_x10 < AIR_TEMP_LOW_X10)
+    {
+        uart_puts("LOW temperature warning\r\n");
+    }
+    else if (air_temp_x10 > AIR_TEMP_HIGH_X10)
+    {
+        uart_puts("HIGH, cooling/fan needed\r\n");
+    }
+    else if (air_temp_x10 < AIR_TEMP_SAFE_X10)
+    {
+        uart_puts("SAFE/COOL RANGE\r\n");
+    }
+    else
+    {
+        uart_puts("NORMAL RANGE\r\n");
+    }
+
+    /* ---------- Humidity ---------- */
+
+    uart_puts("Humidity = ");
+    uart_print_uint_x10(air_hum_x10);
+    uart_puts(" %RH -> ");
+
+    if (air_hum_x10 < RH_LOW_X10)
+    {
+        uart_puts("LOW humidity warning\r\n");
+    }
+    else if (air_hum_x10 > RH_HIGH_X10)
+    {
+        uart_puts("HIGH humidity, ventilation needed\r\n");
+    }
+    else if (air_hum_x10 < RH_SAFE_X10)
+    {
+        uart_puts("OK humidity\r\n");
+    }
+    else
+    {
+        uart_puts("HIGH-NORMAL, monitor\r\n");
+    }
+
+    /* ---------- Soil/corm temperature ---------- */
+
+    uart_puts("Soil/corm temperature = ");
+    uart_print_temp_x100(soil_temp_x100);
+    uart_puts(" C -> ");
+
+    if (soil_temp_x100 < SOIL_TEMP_LOW_X100)
+    {
+        uart_puts("LOW temperature warning\r\n");
+    }
+    else if (soil_temp_x100 > SOIL_TEMP_HIGH_X100)
+    {
+        uart_puts("HIGH, corm-zone cooling may be needed\r\n");
+    }
+    else if (soil_temp_x100 < SOIL_TEMP_SAFE_X100)
+    {
+        uart_puts("SAFE/COOL for corm zone\r\n");
+    }
+    else
+    {
+        uart_puts("NORMAL RANGE\r\n");
+    }
+
+    /* ---------- Light intensity ---------- */
+
+    uart_puts("Light intensity = ");
+    uart_print_uint_x10(light_lux_x10);
+    uart_puts(" lx -> ");
+
+    if (light_lux_x10 < LIGHT_LOW_LUX_X10)
+    {
+        uart_puts("LOW light\r\n");
+    }
+    else if (light_lux_x10 >= LIGHT_OK_LUX_X10)
+    {
+        uart_puts("OK monitor level\r\n");
+    }
+    else
+    {
+        uart_puts("MEDIUM light, monitor\r\n");
+    }
+
+    uart_puts("-------------------------------------------\r\n");
+}
+
+void edge_compute_print_skipped(void)
+{
+    uart_puts("\r\n---------- SAFFRON EDGE DECISION ----------\r\n");
+    uart_puts("Skipped: one or more sensor readings failed.\r\n");
+    uart_puts("-------------------------------------------\r\n");
+}
+
+/* ================= LPM3 SLEEP FUNCTIONS ================= */
+
+void uart_flush_tx(void)
+{
+    while (!(IFG2 & UCA0TXIFG));
+    delay_ms(20);
+}
+
+void adc_sleep_off(void)
+{
+    ADC10CTL0 &= ~ENC;
+    ADC10CTL0 &= ~ADC10ON;
+}
+
+void sleep_5_minutes_lpm3(void)
+{
+    sleep_counter = 0;
+
+    /*
+       Use VLO as ACLK source.
+       VLO is low power but not highly accurate.
+       The 5-minute time can slightly vary in real hardware.
+    */
+    BCSCTL3 = (BCSCTL3 & ~(LFXT1S_3)) | LFXT1S_2;
+
+    TA0CTL = MC_0;
+    TA0CCTL0 = 0;
+    TA0CCR0 = (uint16_t)(ACLK_FREQ_HZ - 1UL);
+    TA0CCTL0 = CCIE;
+    TA0CTL = TASSEL_1 | MC_1 | TACLR;   // ACLK, up mode, clear timer
+
+    __bis_SR_register(LPM3_bits | GIE); // Sleep here until Timer_A wakes CPU
+
+    TA0CTL = MC_0;
+    TA0CCTL0 = 0;
+}
+
+/* ================= SENSOR POWER CONTROL ================= */
+
+void sensor_power_init(void)
+{
+    /*
+       Soil MOSFET   = P1.4
+       BH1750 MOSFET = P2.4
+       SHT3X MOSFET  = P2.5
+
+       Soil is on PORT 1.
+       BH1750 and SHT3X are on PORT 2.
+       Therefore BH1750/SHT3X must use P2SEL, P2SEL2, P2OUT, and P2DIR.
+    */
+
+    /* Port 1 MOSFET pin: Soil on P1.4 */
+    P1SEL  &= ~SOIL_MOSFET;
+    P1SEL2 &= ~SOIL_MOSFET;
+
+    P1OUT &= ~SOIL_MOSFET;
+    P1DIR |=  SOIL_MOSFET;
+
+    /* Port 2 MOSFET pins: BH1750 on P2.4, SHT3X on P2.5 */
+    P2SEL  &= ~(BH1750_MOSFET | SHT3X_MOSFET);
+    P2SEL2 &= ~(BH1750_MOSFET | SHT3X_MOSFET);
+
+    P2OUT &= ~(BH1750_MOSFET | SHT3X_MOSFET);
+    P2DIR |=  (BH1750_MOSFET | SHT3X_MOSFET);
+}
+
+void all_switched_sensors_off(void)
+{
+    P1OUT &= ~SOIL_MOSFET;
+    P2OUT &= ~(BH1750_MOSFET | SHT3X_MOSFET);
+}
+
+void soil_power_on(void)
+{
+    P1OUT |= SOIL_MOSFET;
+}
+
+void soil_power_off(void)
+{
+    P1OUT &= ~SOIL_MOSFET;
+}
+
+void bh1750_power_on(void)
+{
+    P2OUT |= BH1750_MOSFET;     // P2.4 HIGH -> BH1750 ON
+}
+
+void bh1750_power_off(void)
+{
+    P2OUT &= ~BH1750_MOSFET;    // P2.4 LOW -> BH1750 OFF
+}
+
+void sht3x_power_on(void)
+{
+    P2OUT |= SHT3X_MOSFET;     // P2.5 HIGH -> SHT3X ON
+}
+
+void sht3x_power_off(void)
+{
+    P2OUT &= ~SHT3X_MOSFET;    // P2.5 LOW -> SHT3X OFF
+}
+
+/* ================= ADC ================= */
+
+void adc_init(void)
+{
+    ADC10CTL0 &= ~ENC;
+
+    ADC10CTL1 = SOIL_ADC_CHANNEL;
+    ADC10CTL0 = SREF_0 | ADC10SHT_2 | ADC10ON;
+
+    ADC10AE0 |= SOIL_ADC_BIT;
+}
+
+uint16_t adc_read_once(void)
+{
+    ADC10CTL0 |= ENC | ADC10SC;
+
+    while (ADC10CTL1 & ADC10BUSY);
+
+    ADC10CTL0 &= ~ENC;
+
+    return ADC10MEM;
+}
+
+/* ================= I2C ================= */
+
+void i2c_release_pins(void)
+{
+    UCB0CTL1 |= UCSWRST;
+
+    P1SEL  &= ~(I2C_SCL | I2C_SDA);
+    P1SEL2 &= ~(I2C_SCL | I2C_SDA);
+
+    P1DIR &= ~(I2C_SCL | I2C_SDA);
+    P1REN &= ~(I2C_SCL | I2C_SDA);
+}
+
+void i2c_init(void)
+{
+    UCB0CTL1 |= UCSWRST;
+
+    P1SEL  |= I2C_SCL | I2C_SDA;
+    P1SEL2 |= I2C_SCL | I2C_SDA;
+
+    UCB0CTL0 = UCMST | UCMODE_3 | UCSYNC;
+    UCB0CTL1 = UCSSEL_2 | UCSWRST;
+
+    UCB0BR0 = 10;      // 100 kHz @ 1 MHz
+    UCB0BR1 = 0;
+
+    UCB0STAT &= ~UCNACKIFG;
+
+    UCB0CTL1 &= ~UCSWRST;
+}
+
+void i2c_bus_recover(void)
+{
+    uint8_t i;
+
+    i2c_release_pins();
+
+    P1DIR |= I2C_SCL;
+    P1DIR &= ~I2C_SDA;
+
+    for (i = 0; i < 9; i++)
+    {
+        P1OUT &= ~I2C_SCL;
+        delay_ms(1);
+
+        P1OUT |= I2C_SCL;
+        delay_ms(1);
+    }
+
+    P1DIR &= ~(I2C_SCL | I2C_SDA);
+}
+
+uint8_t i2c_write(uint8_t address, uint8_t *data, uint8_t length)
+{
+    uint8_t i;
+    uint16_t timeout;
+
+    while (UCB0CTL1 & UCTXSTP);
+
+    UCB0STAT &= ~UCNACKIFG;
+    UCB0I2CSA = address;
+
+    UCB0CTL1 |= UCTR | UCTXSTT;
+
+    for (i = 0; i < length; i++)
+    {
+        timeout = I2C_TIMEOUT;
+
+        while (!(IFG2 & UCB0TXIFG))
+        {
+            if (UCB0STAT & UCNACKIFG)
+            {
+                UCB0STAT &= ~UCNACKIFG;
+                UCB0CTL1 |= UCTXSTP;
+                return 0;
+            }
+
+            if (--timeout == 0)
+            {
+                UCB0CTL1 |= UCTXSTP;
+                return 0;
+            }
+        }
+
+        UCB0TXBUF = data[i];
+    }
+
+    timeout = I2C_TIMEOUT;
+
+    while (!(IFG2 & UCB0TXIFG))
+    {
+        if (UCB0STAT & UCNACKIFG)
+        {
+            UCB0STAT &= ~UCNACKIFG;
+            UCB0CTL1 |= UCTXSTP;
+            return 0;
+        }
+
+        if (--timeout == 0)
+        {
+            UCB0CTL1 |= UCTXSTP;
+            return 0;
+        }
+    }
+
+    UCB0CTL1 |= UCTXSTP;
+
+    timeout = I2C_TIMEOUT;
+    while ((UCB0CTL1 & UCTXSTP) && timeout--);
+
+    return 1;
+}
+
+uint8_t i2c_read(uint8_t address, uint8_t *data, uint8_t length)
+{
+    uint8_t i;
+    uint16_t timeout;
+
+    if (length == 0)
+    {
+        return 0;
+    }
+
+    while (UCB0CTL1 & UCTXSTP);
+
+    UCB0STAT &= ~UCNACKIFG;
+    UCB0I2CSA = address;
+
+    UCB0CTL1 &= ~UCTR;
+    UCB0CTL1 |= UCTXSTT;
+
+    timeout = I2C_TIMEOUT;
+
+    while (UCB0CTL1 & UCTXSTT)
+    {
+        if (UCB0STAT & UCNACKIFG)
+        {
+            UCB0STAT &= ~UCNACKIFG;
+            UCB0CTL1 |= UCTXSTP;
+            return 0;
+        }
+
+        if (--timeout == 0)
+        {
+            UCB0CTL1 |= UCTXSTP;
+            return 0;
+        }
+    }
+
+    for (i = 0; i < length; i++)
+    {
+        if (i == length - 1)
+        {
+            UCB0CTL1 |= UCTXSTP;
+        }
+
+        timeout = I2C_TIMEOUT;
+
+        while (!(IFG2 & UCB0RXIFG))
+        {
+            if (--timeout == 0)
+            {
+                UCB0CTL1 |= UCTXSTP;
+                return 0;
+            }
+        }
+
+        data[i] = UCB0RXBUF;
+    }
+
+    timeout = I2C_TIMEOUT;
+    while ((UCB0CTL1 & UCTXSTP) && timeout--);
+
+    return 1;
+}
+
+/* ============================================================
+   SOIL MOISTURE SENSOR
+   ============================================================ */
+
+uint16_t read_soil_adc_filtered(void)
+{
+    uint8_t i;
+    uint16_t adc_value;
+    uint16_t min_value = 1023;
+    uint16_t max_value = 0;
+    uint32_t sum = 0;
+
+    for (i = 0; i < 5; i++)
+    {
+        adc_read_once();
+        delay_ms(5);
+    }
+
+    for (i = 0; i < 15; i++)
+    {
+        adc_value = adc_read_once();
+
+        sum += adc_value;
+
+        if (adc_value < min_value)
+        {
+            min_value = adc_value;
+        }
+
+        if (adc_value > max_value)
+        {
+            max_value = adc_value;
+        }
+
+        delay_ms(10);
+    }
+
+    sum = sum - min_value - max_value;
+
+    return (uint16_t)(sum / 13);
+}
+
+uint32_t calibrate_soil_moisture_x10(uint16_t adc_value)
+{
+    int32_t moisture_x10;
+    int32_t dry_adc = (int32_t)SOIL_DRY_ADC;
+    int32_t wet_adc = (int32_t)SOIL_WET_ADC;
+    int32_t adc = (int32_t)adc_value;
+
+    moisture_x10 = ((dry_adc - adc) * 1000) / (dry_adc - wet_adc);
+
+    if (moisture_x10 < 0)
+    {
+        moisture_x10 = 0;
+    }
+
+    if (moisture_x10 > 1000)
+    {
+        moisture_x10 = 1000;
+    }
+
+    return (uint32_t)moisture_x10;
+}
+
+uint32_t ema_filter_soil_x10(uint32_t new_moisture_x10)
+{
+    static uint8_t first_run = 1;
+    static int32_t filtered_moisture_x10 = 0;
+    int32_t error;
+
+    if (first_run)
+    {
+        filtered_moisture_x10 = (int32_t)new_moisture_x10;
+        first_run = 0;
+    }
+    else
+    {
+        error = (int32_t)new_moisture_x10 - filtered_moisture_x10;
+
+        filtered_moisture_x10 = filtered_moisture_x10 +
+                                ((EMA_ALPHA_NUM * error) / EMA_ALPHA_DEN);
+    }
+
+    if (filtered_moisture_x10 < 0)
+    {
+        filtered_moisture_x10 = 0;
+    }
+
+    if (filtered_moisture_x10 > 1000)
+    {
+        filtered_moisture_x10 = 1000;
+    }
+
+    return (uint32_t)filtered_moisture_x10;
+}
+
+uint8_t soil_read_final(uint16_t *raw_adc,
+                        uint32_t *calibrated_moisture_x10,
+                        uint32_t *final_moisture_x10)
+{
+    uint16_t adc_filtered;
+    uint32_t moisture_calibrated;
+
+    i2c_release_pins();
+    all_switched_sensors_off();
+    delay_ms(50);
+
+    soil_power_on();
+    delay_ms(800);
+
+    adc_filtered = read_soil_adc_filtered();
+    moisture_calibrated = calibrate_soil_moisture_x10(adc_filtered);
+
+    *raw_adc = adc_filtered;
+    *calibrated_moisture_x10 = moisture_calibrated;
+    *final_moisture_x10 = ema_filter_soil_x10(moisture_calibrated);
+
+    soil_power_off();
+
+    return 1;
+}
+
+/* ============================================================
+   BH1750 LIGHT SENSOR
+   ============================================================ */
+
+uint8_t bh1750_read_lux_x10(uint8_t address, uint32_t *lux_x10)
+{
+    uint8_t cmd;
+    uint8_t data[2];
+    uint16_t raw;
+
+    cmd = 0x20;      // One-time high resolution mode
+
+    if (!i2c_write(address, &cmd, 1))
+    {
+        return 0;
+    }
+
+    delay_ms(180);
+
+    if (!i2c_read(address, data, 2))
+    {
+        return 0;
+    }
+
+    raw = ((uint16_t)data[0] << 8) | data[1];
+
+    *lux_x10 = ((uint32_t)raw * 100UL) / 12UL;
+
+    return 1;
+}
+
+uint32_t trimmed_mean5_u32(uint32_t a,
+                           uint32_t b,
+                           uint32_t c,
+                           uint32_t d,
+                           uint32_t e)
+{
+    uint32_t arr[5];
+    uint8_t i, j;
+    uint32_t temp;
+
+    arr[0] = a;
+    arr[1] = b;
+    arr[2] = c;
+    arr[3] = d;
+    arr[4] = e;
+
+    for (i = 0; i < 4; i++)
+    {
+        for (j = i + 1; j < 5; j++)
+        {
+            if (arr[j] < arr[i])
+            {
+                temp = arr[i];
+                arr[i] = arr[j];
+                arr[j] = temp;
+            }
+        }
+    }
+
+    return (arr[1] + arr[2] + arr[3]) / 3;
+}
+
+uint32_t calibrate_bh1750_lux_x10(uint32_t bh1750_lux_x10)
+{
+    int32_t x;
+    int32_t y;
+
+    const int32_t X1 = 8663;
+    const int32_t Y1 = 6200;
+
+    const int32_t X2 = 14649;
+    const int32_t Y2 = 10700;
+
+    const int32_t X3 = 39635;
+    const int32_t Y3 = 29000;
+
+    const int32_t X4 = 67785;
+    const int32_t Y4 = 49000;
+
+    const int32_t X5 = 79020;
+    const int32_t Y5 = 60000;
+
+    const int32_t X6 = 94873;
+    const int32_t Y6 = 80000;
+
+    x = (int32_t)bh1750_lux_x10;
+
+    if (x <= X1)
+    {
+        y = (x * Y1) / X1;
+    }
+    else if (x <= X2)
+    {
+        y = Y1 + (((x - X1) * (Y2 - Y1)) / (X2 - X1));
+    }
+    else if (x <= X3)
+    {
+        y = Y2 + (((x - X2) * (Y3 - Y2)) / (X3 - X2));
+    }
+    else if (x <= X4)
+    {
+        y = Y3 + (((x - X3) * (Y4 - Y3)) / (X4 - X3));
+    }
+    else if (x <= X5)
+    {
+        y = Y4 + (((x - X4) * (Y5 - Y4)) / (X5 - X4));
+    }
+    else
+    {
+        y = Y5 + (((x - X5) * (Y6 - Y5)) / (X6 - X5));
+    }
+
+    if (y < 0)
+    {
+        y = 0;
+    }
+
+    return (uint32_t)y;
+}
+
+uint32_t ema_filter_lux_x10(uint32_t new_lux_x10)
+{
+    static uint8_t first_run = 1;
+    static int32_t filtered_lux_x10 = 0;
+    int32_t error;
+
+    if (first_run)
+    {
+        filtered_lux_x10 = (int32_t)new_lux_x10;
+        first_run = 0;
+    }
+    else
+    {
+        error = (int32_t)new_lux_x10 - filtered_lux_x10;
+
+        filtered_lux_x10 = filtered_lux_x10 +
+                           ((EMA_ALPHA_NUM * error) / EMA_ALPHA_DEN);
+    }
+
+    if (filtered_lux_x10 < 0)
+    {
+        filtered_lux_x10 = 0;
+    }
+
+    return (uint32_t)filtered_lux_x10;
+}
+
+uint8_t bh1750_read_final(uint8_t address,
+                          uint32_t *raw_filtered_lux_x10,
+                          uint32_t *calibrated_lux_x10,
+                          uint32_t *final_lux_x10)
+{
+    uint32_t dummy;
+    uint32_t r1, r2, r3, r4, r5;
+    uint32_t raw_filtered;
+    uint32_t calibrated;
+
+    if (!bh1750_read_lux_x10(address, &dummy))
+    {
+        return 0;
+    }
+
+    delay_ms(50);
+
+    if (!bh1750_read_lux_x10(address, &r1)) return 0;
+    delay_ms(50);
+
+    if (!bh1750_read_lux_x10(address, &r2)) return 0;
+    delay_ms(50);
+
+    if (!bh1750_read_lux_x10(address, &r3)) return 0;
+    delay_ms(50);
+
+    if (!bh1750_read_lux_x10(address, &r4)) return 0;
+    delay_ms(50);
+
+    if (!bh1750_read_lux_x10(address, &r5)) return 0;
+
+    raw_filtered = trimmed_mean5_u32(r1, r2, r3, r4, r5);
+    calibrated = calibrate_bh1750_lux_x10(raw_filtered);
+
+    *raw_filtered_lux_x10 = raw_filtered;
+    *calibrated_lux_x10 = calibrated;
+    *final_lux_x10 = ema_filter_lux_x10(calibrated);
+
+    return 1;
+}
+
+uint8_t bh1750_sequence_read(uint32_t *raw_lux_x10,
+                             uint32_t *calibrated_lux_x10,
+                             uint32_t *final_lux_x10)
+{
+    uint8_t ok = 0;
+
+    i2c_release_pins();
+    all_switched_sensors_off();
+    delay_ms(50);
+
+    bh1750_power_on();
+    delay_ms(300);
+
+    i2c_bus_recover();
+    i2c_init();
+
+    if (bh1750_read_final(BH1750_ADDR_1,
+                          raw_lux_x10,
+                          calibrated_lux_x10,
+                          final_lux_x10))
+    {
+        ok = 1;
+    }
+    else
+    {
+        i2c_bus_recover();
+        i2c_init();
+
+        if (bh1750_read_final(BH1750_ADDR_2,
+                              raw_lux_x10,
+                              calibrated_lux_x10,
+                              final_lux_x10))
+        {
+            ok = 1;
+        }
+    }
+
+    i2c_release_pins();
+    bh1750_power_off();
+
+    return ok;
+}
+
+/* ============================================================
+   SHT3X TEMPERATURE AND HUMIDITY SENSOR
+   ============================================================ */
+
+uint8_t sht3x_crc8(uint8_t *data, uint8_t length)
+{
+    uint8_t crc = 0xFF;
+    uint8_t i;
+    uint8_t bit;
+
+    for (i = 0; i < length; i++)
+    {
+        crc ^= data[i];
+
+        for (bit = 0; bit < 8; bit++)
+        {
+            if (crc & 0x80)
+            {
+                crc = (crc << 1) ^ 0x31;
+            }
+            else
+            {
+                crc <<= 1;
+            }
+        }
+    }
+
+    return crc;
+}
+
+uint8_t sht3x_read_temp_humidity(uint8_t address,
+                                 int32_t *temperature_c_x10,
+                                 uint32_t *humidity_x10)
+{
+    uint8_t cmd[2];
+    uint8_t data[6];
+    uint16_t raw_temp;
+    uint16_t raw_hum;
+
+    cmd[0] = 0x24;
+    cmd[1] = 0x00;
+
+    if (!i2c_write(address, cmd, 2))
+    {
+        return 0;
+    }
+
+    delay_ms(20);
+
+    if (!i2c_read(address, data, 6))
+    {
+        return 0;
+    }
+
+    if (sht3x_crc8(&data[0], 2) != data[2])
+    {
+        return 0;
+    }
+
+    if (sht3x_crc8(&data[3], 2) != data[5])
+    {
+        return 0;
+    }
+
+    raw_temp = ((uint16_t)data[0] << 8) | data[1];
+    raw_hum  = ((uint16_t)data[3] << 8) | data[4];
+
+    *temperature_c_x10 = -450 + (((int32_t)1750 * raw_temp) / 65535);
+    *humidity_x10 = ((uint32_t)1000 * raw_hum) / 65535;
+
+    return 1;
+}
+
+int32_t trimmed_mean5_i32(int32_t a,
+                          int32_t b,
+                          int32_t c,
+                          int32_t d,
+                          int32_t e)
+{
+    int32_t arr[5];
+    int32_t temp;
+    uint8_t i, j;
+
+    arr[0] = a;
+    arr[1] = b;
+    arr[2] = c;
+    arr[3] = d;
+    arr[4] = e;
+
+    for (i = 0; i < 4; i++)
+    {
+        for (j = i + 1; j < 5; j++)
+        {
+            if (arr[j] < arr[i])
+            {
+                temp = arr[i];
+                arr[i] = arr[j];
+                arr[j] = temp;
+            }
+        }
+    }
+
+    return (arr[1] + arr[2] + arr[3]) / 3;
+}
+
+int32_t ema_filter_temperature_x10(int32_t new_temp_x10)
+{
+    static uint8_t first_run = 1;
+    static int32_t filtered_temp_x10 = 0;
+    int32_t error;
+
+    if (first_run)
+    {
+        filtered_temp_x10 = new_temp_x10;
+        first_run = 0;
+    }
+    else
+    {
+        error = new_temp_x10 - filtered_temp_x10;
+        filtered_temp_x10 = filtered_temp_x10 +
+                            ((EMA_ALPHA_NUM * error) / EMA_ALPHA_DEN);
+    }
+
+    return filtered_temp_x10;
+}
+
+uint32_t ema_filter_humidity_x10(uint32_t new_hum_x10)
+{
+    static uint8_t first_run = 1;
+    static int32_t filtered_hum_x10 = 0;
+    int32_t error;
+
+    if (first_run)
+    {
+        filtered_hum_x10 = (int32_t)new_hum_x10;
+        first_run = 0;
+    }
+    else
+    {
+        error = (int32_t)new_hum_x10 - filtered_hum_x10;
+        filtered_hum_x10 = filtered_hum_x10 +
+                           ((EMA_ALPHA_NUM * error) / EMA_ALPHA_DEN);
+    }
+
+    if (filtered_hum_x10 < 0)
+    {
+        filtered_hum_x10 = 0;
+    }
+
+    if (filtered_hum_x10 > 1000)
+    {
+        filtered_hum_x10 = 1000;
+    }
+
+    return (uint32_t)filtered_hum_x10;
+}
+
+uint8_t sht3x_read_filtered(uint8_t address,
+                            int32_t *raw_filtered_temp_x10,
+                            uint32_t *raw_filtered_hum_x10,
+                            int32_t *final_temp_x10,
+                            uint32_t *final_hum_x10)
+{
+    int32_t dummy_temp;
+    uint32_t dummy_hum;
+    int32_t t1, t2, t3, t4, t5;
+    uint32_t h1, h2, h3, h4, h5;
+    int32_t temp_trimmed;
+    uint32_t hum_trimmed;
+
+    if (!sht3x_read_temp_humidity(address, &dummy_temp, &dummy_hum))
+    {
+        return 0;
+    }
+
+    delay_ms(50);
+
+    if (!sht3x_read_temp_humidity(address, &t1, &h1)) return 0;
+    delay_ms(50);
+
+    if (!sht3x_read_temp_humidity(address, &t2, &h2)) return 0;
+    delay_ms(50);
+
+    if (!sht3x_read_temp_humidity(address, &t3, &h3)) return 0;
+    delay_ms(50);
+
+    if (!sht3x_read_temp_humidity(address, &t4, &h4)) return 0;
+    delay_ms(50);
+
+    if (!sht3x_read_temp_humidity(address, &t5, &h5)) return 0;
+
+    temp_trimmed = trimmed_mean5_i32(t1, t2, t3, t4, t5);
+    hum_trimmed  = trimmed_mean5_u32(h1, h2, h3, h4, h5);
+
+    *raw_filtered_temp_x10 = temp_trimmed;
+    *raw_filtered_hum_x10  = hum_trimmed;
+
+    *final_temp_x10 = ema_filter_temperature_x10(temp_trimmed);
+    *final_hum_x10  = ema_filter_humidity_x10(hum_trimmed);
+
+    return 1;
+}
+
+uint8_t sht3x_sequence_read(int32_t *raw_temp_x10,
+                            uint32_t *raw_hum_x10,
+                            int32_t *final_temp_x10,
+                            uint32_t *final_hum_x10)
+{
+    uint8_t ok = 0;
+
+    i2c_release_pins();
+    all_switched_sensors_off();
+    delay_ms(50);
+
+    sht3x_power_on();
+    delay_ms(300);
+
+    i2c_bus_recover();
+    i2c_init();
+
+    if (sht3x_read_filtered(SHT3X_ADDR_1,
+                            raw_temp_x10,
+                            raw_hum_x10,
+                            final_temp_x10,
+                            final_hum_x10))
+    {
+        ok = 1;
+    }
+    else
+    {
+        i2c_bus_recover();
+        i2c_init();
+
+        if (sht3x_read_filtered(SHT3X_ADDR_2,
+                                raw_temp_x10,
+                                raw_hum_x10,
+                                final_temp_x10,
+                                final_hum_x10))
+        {
+            ok = 1;
+        }
+    }
+
+    i2c_release_pins();
+    sht3x_power_off();
+
+    return ok;
+}
+
+/* ============================================================
+   DS18B20 SOIL TEMPERATURE SENSOR - ALWAYS ON
+   ============================================================ */
+
+void ds18b20_init(void)
+{
+    DS18B20_SEL  &= ~DS18B20_PIN;
+    DS18B20_SEL2 &= ~DS18B20_PIN;
+
+    // Use external 4.7k pull-up from DATA to 3.3V.
+    DS18B20_REN &= ~DS18B20_PIN;
+
+    // Release 1-Wire bus
+    DS18B20_DIR &= ~DS18B20_PIN;
+}
+
+void ds18b20_low(void)
+{
+    DS18B20_OUT &= ~DS18B20_PIN;
+    DS18B20_DIR |= DS18B20_PIN;
+}
+
+void ds18b20_release(void)
+{
+    DS18B20_DIR &= ~DS18B20_PIN;
+}
+
+uint8_t ds18b20_read_pin(void)
+{
+    return (DS18B20_IN & DS18B20_PIN) ? 1 : 0;
+}
+
+uint8_t ds18b20_reset(void)
+{
+    uint8_t presence;
+
+    ds18b20_low();
+    __delay_cycles(480);
+
+    ds18b20_release();
+    __delay_cycles(70);
+
+    presence = !ds18b20_read_pin();
+
+    __delay_cycles(410);
+
+    return presence;
+}
+
+void ds18b20_write_bit(uint8_t bit)
+{
+    if (bit)
+    {
+        ds18b20_low();
+        __delay_cycles(6);
+        ds18b20_release();
+        __delay_cycles(64);
+    }
+    else
+    {
+        ds18b20_low();
+        __delay_cycles(60);
+        ds18b20_release();
+        __delay_cycles(10);
+    }
+}
+
+uint8_t ds18b20_read_bit(void)
+{
+    uint8_t bit;
+
+    ds18b20_low();
+    __delay_cycles(6);
+
+    ds18b20_release();
+    __delay_cycles(9);
+
+    bit = ds18b20_read_pin();
+
+    __delay_cycles(55);
+
+    return bit;
+}
+
+void ds18b20_write_byte(uint8_t data)
+{
+    uint8_t i;
+
+    for (i = 0; i < 8; i++)
+    {
+        ds18b20_write_bit(data & 0x01);
+        data >>= 1;
+    }
+}
+
+uint8_t ds18b20_read_byte(void)
+{
+    uint8_t i;
+    uint8_t data = 0;
+
+    for (i = 0; i < 8; i++)
+    {
+        if (ds18b20_read_bit())
+        {
+            data |= (1 << i);
+        }
+    }
+
+    return data;
+}
+
+uint8_t ds18b20_crc8(uint8_t *data, uint8_t len)
+{
+    uint8_t crc = 0;
+    uint8_t i, j;
+
+    for (i = 0; i < len; i++)
+    {
+        crc ^= data[i];
+
+        for (j = 0; j < 8; j++)
+        {
+            if (crc & 0x01)
+            {
+                crc = (crc >> 1) ^ 0x8C;
+            }
+            else
+            {
+                crc >>= 1;
+            }
+        }
+    }
+
+    return crc;
+}
+
+uint8_t ds18b20_read_raw_temperature(int16_t *raw_temp)
+{
+    uint8_t scratchpad[9];
+    uint8_t i;
+
+    if (!ds18b20_reset())
+    {
+        return 0;      // not detected
+    }
+
+    ds18b20_write_byte(0xCC);  // Skip ROM
+    ds18b20_write_byte(0x44);  // Convert T
+
+    __delay_cycles(750000);    // 750 ms for 12-bit conversion @ 1 MHz
+
+    if (!ds18b20_reset())
+    {
+        return 0;
+    }
+
+    ds18b20_write_byte(0xCC);  // Skip ROM
+    ds18b20_write_byte(0xBE);  // Read scratchpad
+
+    for (i = 0; i < 9; i++)
+    {
+        scratchpad[i] = ds18b20_read_byte();
+    }
+
+    if (ds18b20_crc8(scratchpad, 8) != scratchpad[8])
+    {
+        return 2;      // CRC error
+    }
+
+    *raw_temp = (int16_t)((scratchpad[1] << 8) | scratchpad[0]);
+
+    return 1;
+}
+
+int32_t ds18b20_raw_to_x100(int16_t raw)
+{
+    return ((int32_t)raw * 100) / 16;
+}
+
+int32_t ds18b20_get_filtered_temperature_x100(void)
+{
+    uint8_t i;
+    uint8_t status;
+    uint8_t valid_count = 0;
+
+    int16_t raw_temperature;
+    int32_t temp_x100;
+    int32_t sum_x100 = 0;
+    int32_t average_x100;
+
+    for (i = 0; i < DS18B20_FILTER_SAMPLES; i++)
+    {
+        status = ds18b20_read_raw_temperature(&raw_temperature);
+
+        if (status == 1)
+        {
+            temp_x100 = ds18b20_raw_to_x100(raw_temperature);
+            sum_x100 += temp_x100;
+            valid_count++;
+        }
+        else if (status == 0)
+        {
+            uart_puts("DS18B20 sample failed: not detected\r\n");
+        }
+        else if (status == 2)
+        {
+            uart_puts("DS18B20 sample failed: CRC error\r\n");
+        }
+
+        delay_ms(100);
+    }
+
+    if (valid_count == 0)
+    {
+        return DS18B20_ERROR_VALUE_X100;
+    }
+
+    average_x100 = sum_x100 / valid_count;
+    average_x100 = average_x100 + DS18B20_CAL_OFFSET_X100;
+
+    return average_x100;
+}
+
+int32_t ds18b20_sequence_read(void)
+{
+    // DS18B20 is always powered, but I2C and switched sensors should be idle.
+    i2c_release_pins();
+    all_switched_sensors_off();
+    delay_ms(50);
+
+    return ds18b20_get_filtered_temperature_x100();
+}
+
+
+/* ============================================================
+   NEC-STYLE 64-BIT IR UPLINK TRANSMISSION TO GROW LIGHT
+
+   Direction:
+   - This MSP430 control node TRANSMITS the IR status frame.
+   - The grow light side must have the IR receiver module.
+
+   Pin:
+   - P1.5 = IR_TX_PIN. Use a transistor/MOSFET driver for the IR LED.
+
+   Timing:
+   - NEC-style 38 kHz carrier
+   - Start: 9 ms mark + 4.5 ms space
+   - Bit 0: 562 us mark + 562 us space
+   - Bit 1: 562 us mark + 1687 us space
+   - End: 562 us mark
+
+   Frame: 64 bits = 8 bytes
+   Byte 0: [Grow Light ID 4 bits][Node ID 4 bits]
+   Byte 1: [Frame Type 4 bits][Actuator Status 4 bits]
+   Byte 2: Soil moisture percentage, 0 to 100
+   Byte 3: Air temperature encoded as (temp_C + 20) * 2
+   Byte 4: Air humidity percentage, 0 to 100
+   Byte 5: Light encoded as lux / 100, 0 to 255
+   Byte 6: Soil temperature encoded as (temp_C + 20) * 2
+   Byte 7: CRC-8 over Byte 0 to Byte 6
+
+   Actuator status bits:
+   bit 0 = Fan
+   bit 1 = Irrigation pump / solenoid
+   bit 2 = Humidifier
+   bit 3 = Peltier cooling
+   ============================================================ */
+
+#define GROW_LIGHT_ID              2
+#define CONTROL_NODE_ID            3
+
+#define IR_FRAME_TYPE_NORMAL       0x01
+#define IR_FRAME_TYPE_ACK          0x02
+#define IR_FRAME_TYPE_ERROR        0x03
+#define IR_FRAME_TYPE_LOW_POWER    0x04
+
+#define ACT_FAN_BIT                BIT0
+#define ACT_IRRIGATION_BIT         BIT1
+#define ACT_HUMIDIFIER_BIT         BIT2
+#define ACT_PELTIER_BIT            BIT3
+
+#define IR_REPEAT_COUNT            3
+#define IR_REPEAT_GAP_MS           45      // gap between the 3 identical bursts
+
+void ir_tx_init(void)
+{
+    P1SEL  &= ~IR_TX_PIN;
+    P1SEL2 &= ~IR_TX_PIN;
+
+    P1OUT &= ~IR_TX_PIN;
+    P1DIR |=  IR_TX_PIN;
+}
+
+void ir_tx_off(void)
+{
+    P1OUT &= ~IR_TX_PIN;
+}
+
+/* 38 kHz carrier burst.
+   One carrier period is approximately 26 us.
+   At 1 MHz DCO, this software carrier is approximate but suitable for
+   TSOP/VS1838 style IR receiver modules in a practical prototype. */
+void ir_mark_us(uint16_t duration_us)
+{
+    uint16_t cycles;
+
+    cycles = duration_us / 26;
+
+    while (cycles--)
+    {
+        P1OUT |= IR_TX_PIN;
+        __delay_cycles(11);
+        P1OUT &= ~IR_TX_PIN;
+        __delay_cycles(11);
+    }
+}
+
+void ir_space_562us(void)
+{
+    ir_tx_off();
+    __delay_cycles(562);
+}
+
+void ir_space_1687us(void)
+{
+    ir_tx_off();
+    __delay_cycles(1687);
+}
+
+void ir_space_4500us(void)
+{
+    ir_tx_off();
+    __delay_cycles(4500);
+}
+
+void ir_send_bit(uint8_t bit_value)
+{
+    ir_mark_us(562);
+
+    if (bit_value)
+    {
+        ir_space_1687us();
+    }
+    else
+    {
+        ir_space_562us();
+    }
+}
+
+/* NEC normally sends data LSB first.
+   This code sends Byte0 to Byte7, but each byte is sent LSB first. */
+void ir_send_byte_lsb_first(uint8_t data)
+{
+    uint8_t i;
+
+    for (i = 0; i < 8; i++)
+    {
+        ir_send_bit(data & 0x01);
+        data >>= 1;
+    }
+}
+
+void ir_send_64bit_frame(uint8_t *frame)
+{
+    uint8_t i;
+
+    /* Keep timing clean during IR transmission. */
+    __disable_interrupt();
+
+    /* NEC start condition */
+    ir_mark_us(9000);
+    ir_space_4500us();
+
+    for (i = 0; i < 8; i++)
+    {
+        ir_send_byte_lsb_first(frame[i]);
+    }
+
+    /* End mark */
+    ir_mark_us(562);
+    ir_tx_off();
+
+    __enable_interrupt();
+}
+
+void ir_send_64bit_frame_repeated(uint8_t *frame, uint8_t repeat_count)
+{
+    uint8_t i;
+
+    for (i = 0; i < repeat_count; i++)
+    {
+        ir_send_64bit_frame(frame);
+        delay_ms(IR_REPEAT_GAP_MS);
+    }
+}
+
+uint8_t ir_crc8_poly07(uint8_t *data, uint8_t length)
+{
+    uint8_t crc = 0x00;
+    uint8_t i;
+    uint8_t bit;
+
+    for (i = 0; i < length; i++)
+    {
+        crc ^= data[i];
+
+        for (bit = 0; bit < 8; bit++)
+        {
+            if (crc & 0x80)
+            {
+                crc = (crc << 1) ^ 0x07;
+            }
+            else
+            {
+                crc <<= 1;
+            }
+        }
+    }
+
+    return crc;
+}
+
+uint8_t clamp_u8_from_u32(uint32_t value, uint32_t max_value)
+{
+    if (value > max_value)
+    {
+        value = max_value;
+    }
+
+    if (value > 255)
+    {
+        value = 255;
+    }
+
+    return (uint8_t)value;
+}
+
+uint8_t encode_temperature_x10_to_u8(int32_t temp_x10)
+{
+    int32_t encoded;
+
+    /* encoded = (temperature_C + 20) * 2
+       Since temp_x10 is in 0.1 C:
+       encoded = ((temp_x10 / 10) + 20) * 2
+       Better integer form: encoded = (temp_x10 + 200) / 5
+       Example: 25.5 C -> (255 + 200) / 5 = 91
+    */
+    encoded = (temp_x10 + 200) / 5;
+
+    if (encoded < 0)
+    {
+        encoded = 0;
+    }
+
+    if (encoded > 255)
+    {
+        encoded = 255;
+    }
+
+    return (uint8_t)encoded;
+}
+
+uint8_t encode_temperature_x100_to_u8(int32_t temp_x100)
+{
+    int32_t encoded;
+
+    /* encoded = (temperature_C + 20) * 2
+       Since temp_x100 is in 0.01 C:
+       encoded = (temp_x100 + 2000) / 50
+       Example: 24.50 C -> (2450 + 2000) / 50 = 89
+    */
+    encoded = (temp_x100 + 2000) / 50;
+
+    if (encoded < 0)
+    {
+        encoded = 0;
+    }
+
+    if (encoded > 255)
+    {
+        encoded = 255;
+    }
+
+    return (uint8_t)encoded;
+}
+
+uint8_t build_actuator_status(uint32_t soil_moisture_x10,
+                              int32_t air_temp_x10,
+                              uint32_t air_hum_x10,
+                              int32_t soil_temp_x100)
+{
+    uint8_t status = 0;
+
+    /* Fan ON if air is hot OR humidity is too high. */
+    if ((air_temp_x10 > AIR_TEMP_HIGH_X10) ||
+        (air_hum_x10 > RH_HIGH_X10))
+    {
+        status |= ACT_FAN_BIT;
+    }
+
+    /* Irrigation ON if soil moisture is low. */
+    if (soil_moisture_x10 < SOIL_LOW_X10)
+    {
+        status |= ACT_IRRIGATION_BIT;
+    }
+
+    /* Humidifier ON if air humidity is low. */
+    if (air_hum_x10 < RH_LOW_X10)
+    {
+        status |= ACT_HUMIDIFIER_BIT;
+    }
+
+    /* Peltier ON if soil/corm temperature is too high. */
+    if (soil_temp_x100 > SOIL_TEMP_HIGH_X100)
+    {
+        status |= ACT_PELTIER_BIT;
+    }
+
+    return status;
+}
+
+void build_ir_status_frame(uint8_t *frame,
+                           uint8_t frame_type,
+                           uint8_t actuator_status,
+                           uint32_t soil_moisture_x10,
+                           int32_t air_temp_x10,
+                           uint32_t air_hum_x10,
+                           uint32_t light_lux_x10,
+                           int32_t soil_temp_x100)
+{
+    frame[0] = (uint8_t)(((GROW_LIGHT_ID & 0x0F) << 4) |
+                         (CONTROL_NODE_ID & 0x0F));
+
+    frame[1] = (uint8_t)(((frame_type & 0x0F) << 4) |
+                         (actuator_status & 0x0F));
+
+    /* soil_moisture_x10: 250 means 25.0%, so divide by 10. */
+    frame[2] = clamp_u8_from_u32((soil_moisture_x10 + 5) / 10, 100);
+
+    frame[3] = encode_temperature_x10_to_u8(air_temp_x10);
+
+    /* air_hum_x10: 650 means 65.0%, so divide by 10. */
+    frame[4] = clamp_u8_from_u32((air_hum_x10 + 5) / 10, 100);
+
+    /* light_lux_x10: 120000 means 12000.0 lux.
+       Encode as lux / 100, so divide x10 value by 1000. */
+    frame[5] = clamp_u8_from_u32((light_lux_x10 + 500) / 1000, 255);
+
+    frame[6] = encode_temperature_x100_to_u8(soil_temp_x100);
+
+    frame[7] = ir_crc8_poly07(frame, 7);
+}
+
+void build_ir_error_frame(uint8_t *frame, uint8_t error_code)
+{
+    frame[0] = (uint8_t)(((GROW_LIGHT_ID & 0x0F) << 4) |
+                         (CONTROL_NODE_ID & 0x0F));
+    frame[1] = (uint8_t)(((IR_FRAME_TYPE_ERROR & 0x0F) << 4) | 0x00);
+    frame[2] = error_code;
+    frame[3] = 0;
+    frame[4] = 0;
+    frame[5] = 0;
+    frame[6] = 0;
+    frame[7] = ir_crc8_poly07(frame, 7);
+}
+
+void uart_print_hex_nibble(uint8_t value)
+{
+    value &= 0x0F;
+
+    if (value < 10)
+    {
+        uart_putc('0' + value);
+    }
+    else
+    {
+        uart_putc('A' + (value - 10));
+    }
+}
+
+void uart_print_hex_byte(uint8_t value)
+{
+    uart_print_hex_nibble(value >> 4);
+    uart_print_hex_nibble(value);
+}
+
+void uart_print_ir_frame(uint8_t *frame)
+{
+    uint8_t i;
+
+    uart_puts("IR 64-bit frame = ");
+
+    for (i = 0; i < 8; i++)
+    {
+        uart_print_hex_byte(frame[i]);
+
+        if (i < 7)
+        {
+            uart_putc(' ');
+        }
+    }
+
+    uart_puts("\r\n");
+}
+
+/* ================= MAIN ================= */
+
+int main(void)
+{
+    uint16_t soil_raw_adc;
+    uint32_t soil_cal_x10;
+    uint32_t soil_final_x10;
+
+    uint32_t light_raw_x10;
+    uint32_t light_cal_x10;
+    uint32_t light_final_x10;
+
+    int32_t air_temp_raw_x10;
+    uint32_t air_hum_raw_x10;
+    int32_t air_temp_final_x10;
+    uint32_t air_hum_final_x10;
+
+    int32_t soil_temp_x100;
+
+    uint8_t bh_ok;
+    uint8_t sht_ok;
+
+    uint8_t actuator_status;
+    uint8_t ir_frame[8];
+
+    WDTCTL = WDTPW | WDTHOLD;
+
+    clock_init();
+    uart_init();
+    adc_init();
+    sensor_power_init();
+    ds18b20_init();
+    ir_tx_init();
+
+    all_switched_sensors_off();
+    i2c_release_pins();
+
+    uart_puts("\r\n====================================\r\n");
+    uart_puts("Final 4-Sensor Sequencing System\r\n");
+    uart_puts("Soil MOSFET   = P1.4\r\n");
+    uart_puts("BH1750 MOSFET = P2.4\r\n");
+    uart_puts("SHT3X MOSFET  = P2.5\r\n");
+    uart_puts("DS18B20 DATA  = P1.1, always ON\r\n");
+    uart_puts("Soil ADC      = P1.3 / A3\r\n");
+    uart_puts("I2C SCL/SDA   = P1.6 / P1.7\r\n");
+    uart_puts("UART TX only  = P1.2\r\n");
+    uart_puts("IR uplink TX  = P1.5, NEC-style 64-bit, 3-burst packet\r\n");
+    uart_puts("Edge mode     = decision print only, no actuator control\r\n");
+    uart_puts("Plant mode     = saffron thresholds\r\n");
+    uart_puts("Sleep mode     = LPM3, 5-minute cycle\r\n");
+    uart_puts("====================================\r\n");
+
+    while (1)
+    {
+        uart_puts("\r\n============== NEW CYCLE ==============\r\n");
+
+        /* ---------- 1. SOIL MOISTURE SENSOR ---------- */
+
+        uart_puts("\r\n[1] Soil moisture sensor ON\r\n");
+
+        soil_read_final(&soil_raw_adc,
+                        &soil_cal_x10,
+                        &soil_final_x10);
+
+        uart_puts("Soil raw filtered ADC = ");
+        uart_print_uint32(soil_raw_adc);
+        uart_puts("\r\n");
+
+        uart_puts("Soil calibrated moisture = ");
+        uart_print_uint_x10(soil_cal_x10);
+        uart_puts(" %\r\n");
+
+        uart_puts("Soil final moisture = ");
+        uart_print_uint_x10(soil_final_x10);
+        uart_puts(" %\r\n");
+
+        uart_puts("Soil moisture sensor OFF\r\n");
+
+        delay_ms(500);
+
+        /* ---------- 2. BH1750 LIGHT SENSOR ---------- */
+
+        uart_puts("\r\n[2] BH1750 light sensor ON\r\n");
+
+        bh_ok = bh1750_sequence_read(&light_raw_x10,
+                                     &light_cal_x10,
+                                     &light_final_x10);
+
+        if (bh_ok)
+        {
+            uart_puts("BH1750 raw filtered lux = ");
+            uart_print_uint_x10(light_raw_x10);
+            uart_puts(" lx\r\n");
+
+            uart_puts("BH1750 calibrated lux = ");
+            uart_print_uint_x10(light_cal_x10);
+            uart_puts(" lx\r\n");
+
+            uart_puts("BH1750 final lux = ");
+            uart_print_uint_x10(light_final_x10);
+            uart_puts(" lx\r\n");
+        }
+        else
+        {
+            uart_puts("BH1750 read failed\r\n");
+        }
+
+        uart_puts("BH1750 light sensor OFF\r\n");
+
+        delay_ms(500);
+
+        /* ---------- 3. SHT3X TEMPERATURE/HUMIDITY SENSOR ---------- */
+
+        uart_puts("\r\n[3] SHT3X temperature/humidity sensor ON\r\n");
+
+        sht_ok = sht3x_sequence_read(&air_temp_raw_x10,
+                                     &air_hum_raw_x10,
+                                     &air_temp_final_x10,
+                                     &air_hum_final_x10);
+
+        if (sht_ok)
+        {
+            uart_puts("SHT3X raw filtered air temperature = ");
+            uart_print_int_x10(air_temp_raw_x10);
+            uart_puts(" C\r\n");
+
+            uart_puts("SHT3X raw filtered humidity = ");
+            uart_print_uint_x10(air_hum_raw_x10);
+            uart_puts(" %RH\r\n");
+
+            uart_puts("SHT3X final air temperature = ");
+            uart_print_int_x10(air_temp_final_x10);
+            uart_puts(" C\r\n");
+
+            uart_puts("SHT3X final humidity = ");
+            uart_print_uint_x10(air_hum_final_x10);
+            uart_puts(" %RH\r\n");
+        }
+        else
+        {
+            uart_puts("SHT3X read failed\r\n");
+        }
+
+        uart_puts("SHT3X sensor OFF\r\n");
+
+        delay_ms(500);
+
+        /* ---------- 4. DS18B20 SOIL TEMPERATURE SENSOR ---------- */
+
+        uart_puts("\r\n[4] DS18B20 soil temperature sensor reading\r\n");
+
+        soil_temp_x100 = ds18b20_sequence_read();
+
+        if (soil_temp_x100 == DS18B20_ERROR_VALUE_X100)
+        {
+            uart_puts("DS18B20 final soil temperature = READ ERROR\r\n");
+        }
+        else
+        {
+            uart_puts("DS18B20 final soil temperature = ");
+            uart_print_temp_x100(soil_temp_x100);
+            uart_puts(" C\r\n");
+        }
+
+        /* ---------- 5. EDGE COMPUTING DECISION + IR STATUS UPLINK ---------- */
+
+        if ((bh_ok == 1) && (sht_ok == 1) &&
+            (soil_temp_x100 != DS18B20_ERROR_VALUE_X100))
+        {
+            edge_compute_print_decisions(soil_final_x10,
+                                         light_final_x10,
+                                         air_temp_final_x10,
+                                         air_hum_final_x10,
+                                         soil_temp_x100);
+
+            actuator_status = build_actuator_status(soil_final_x10,
+                                                    air_temp_final_x10,
+                                                    air_hum_final_x10,
+                                                    soil_temp_x100);
+
+            build_ir_status_frame(ir_frame,
+                                  IR_FRAME_TYPE_NORMAL,
+                                  actuator_status,
+                                  soil_final_x10,
+                                  air_temp_final_x10,
+                                  air_hum_final_x10,
+                                  light_final_x10,
+                                  soil_temp_x100);
+
+            uart_puts("\r\n[5] Sending normal sensor + actuator status by IR\r\n");
+            uart_puts("Actuator status bits: bit0 Fan, bit1 Irrigation, bit2 Humidifier, bit3 Peltier\r\n");
+            uart_puts("Actuator status = 0x");
+            uart_print_hex_byte(actuator_status);
+            uart_puts("\r\n");
+            uart_print_ir_frame(ir_frame);
+
+            ir_send_64bit_frame_repeated(ir_frame, IR_REPEAT_COUNT);
+            uart_puts("IR status packet sent as 3 identical bursts\r\n");
+        }
+        else
+        {
+            edge_compute_print_skipped();
+
+            build_ir_error_frame(ir_frame, 0x01);
+
+            uart_puts("\r\n[5] Sending IR error frame because one or more sensor readings failed\r\n");
+            uart_print_ir_frame(ir_frame);
+
+            ir_send_64bit_frame_repeated(ir_frame, IR_REPEAT_COUNT);
+            uart_puts("IR error packet sent as 3 identical bursts\r\n");
+        }
+
+        all_switched_sensors_off();
+        i2c_release_pins();
+
+        uart_puts("\r\n============== CYCLE DONE ==============\r\n");
+        uart_puts("Going to LPM3 sleep for 5 minutes...\r\n");
+
+        uart_flush_tx();
+
+        /* Turn ADC off during sleep to reduce current. */
+        adc_sleep_off();
+
+        sleep_5_minutes_lpm3();
+
+        /* Re-enable ADC after wake-up for the next soil reading. */
+        adc_init();
+
+        uart_puts("\r\nWake up from LPM3. Starting next cycle.\r\n");
+    }
+}
+
+/* ================= TIMER_A0 ISR FOR LPM3 WAKE-UP ================= */
+
+#pragma vector = TIMER0_A0_VECTOR
+__interrupt void Timer_A0_ISR(void)
+{
+    sleep_counter++;
+
+    if (sleep_counter >= SLEEP_SECONDS)
+    {
+        __bic_SR_register_on_exit(LPM3_bits);
+    }
+}
