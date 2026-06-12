@@ -1,0 +1,666 @@
+#include <msp430.h>
+#include <stdint.h>
+
+/*
+   BH1750 raw vs filtered comparison test
+   MCU: MSP430G2553
+   IDE: Code Composer Studio
+
+   CSV output:
+   sample,raw_lux,filtered_lux,calibrated_lux,ema_lux,status
+
+   BH1750 sensor power is controlled using BSS138 MOSFET on P2.4.
+   I2C pins:
+   SCL = P1.6
+   SDA = P1.7
+
+   UART TX:
+   P1.2, 9600 baud
+*/
+
+/* ================= PIN DEFINITIONS ================= */
+
+#define UART_TX_PIN         BIT2      // P1.2 -> UART TX
+
+#define I2C_SCL_PIN         BIT6      // P1.6 -> I2C SCL
+#define I2C_SDA_PIN         BIT7      // P1.7 -> I2C SDA
+
+#define BH1750_MOSFET_PIN   BIT4      // P2.4 -> BSS138 gate for BH1750 power
+
+/* ================= BH1750 SETTINGS ================= */
+
+#define BH1750_ADDR                 0x23
+
+#define BH1750_POWER_ON             0x01
+#define BH1750_RESET                0x07
+#define BH1750_ONE_TIME_HIGH_RES    0x20
+
+/* ================= TEST SETTINGS ================= */
+
+#define TOTAL_SAMPLES               100
+#define SAMPLE_DELAY_MS             1000
+
+/* ================= FILTER SETTINGS ================= */
+
+#define BH1750_TRIM_SAMPLE_COUNT    5
+
+/*
+   EMA alpha = 0.25
+   filtered = 0.25 * new + 0.75 * old
+
+   Integer form:
+   filtered = (1 * new + 3 * old) / 4
+*/
+
+#define LUX_EMA_NEW_WEIGHT          1
+#define LUX_EMA_OLD_WEIGHT          3
+
+/* ================= GLOBAL VARIABLES ================= */
+
+uint32_t lux_ema_x10 = 0;
+uint8_t lux_ema_initialized = 0;
+
+/* ================= DELAY FUNCTIONS ================= */
+
+void delay_us(uint16_t us)
+{
+    while (us--)
+    {
+        __delay_cycles(1);       // 1 MHz clock -> 1 us
+    }
+}
+
+void delay_ms(uint16_t ms)
+{
+    while (ms--)
+    {
+        __delay_cycles(1000);    // 1 MHz clock -> 1 ms
+    }
+}
+
+/* ================= CLOCK INIT ================= */
+
+void clock_init(void)
+{
+    WDTCTL = WDTPW | WDTHOLD;    // Stop watchdog timer
+
+    if (CALBC1_1MHZ != 0xFF)
+    {
+        DCOCTL = 0;
+        BCSCTL1 = CALBC1_1MHZ;
+        DCOCTL = CALDCO_1MHZ;
+    }
+}
+
+/* ================= UART FUNCTIONS ================= */
+
+void uart_init(void)
+{
+    /*
+       UART TX only
+       P1.2 = UCA0TXD
+       Baud rate = 9600
+       Clock = 1 MHz SMCLK
+    */
+
+    P1SEL  |= UART_TX_PIN;
+    P1SEL2 |= UART_TX_PIN;
+
+    UCA0CTL1 |= UCSWRST;
+    UCA0CTL1 |= UCSSEL_2;       // SMCLK
+
+    UCA0BR0 = 104;              // 1 MHz / 9600
+    UCA0BR1 = 0;
+    UCA0MCTL = UCBRS0;
+
+    UCA0CTL1 &= ~UCSWRST;
+}
+
+void uart_putc(char c)
+{
+    while (!(IFG2 & UCA0TXIFG));
+    UCA0TXBUF = c;
+}
+
+void uart_puts(const char *str)
+{
+    while (*str)
+    {
+        uart_putc(*str++);
+    }
+}
+
+void uart_print_uint32(uint32_t value)
+{
+    char buffer[11];
+    uint8_t i = 0;
+
+    if (value == 0)
+    {
+        uart_putc('0');
+        return;
+    }
+
+    while (value > 0)
+    {
+        buffer[i++] = (char)((value % 10) + '0');
+        value /= 10;
+    }
+
+    while (i > 0)
+    {
+        uart_putc(buffer[--i]);
+    }
+}
+
+void uart_print_uint16(uint16_t value)
+{
+    uart_print_uint32((uint32_t)value);
+}
+
+void uart_print_x10(uint32_t value_x10)
+{
+    /*
+       Print x10 fixed-point value.
+
+       Example:
+       0    -> 0.0
+       253  -> 25.3
+       1000 -> 100.0
+    */
+
+    uart_print_uint32(value_x10 / 10);
+    uart_putc('.');
+    uart_print_uint32(value_x10 % 10);
+}
+
+/* ================= BH1750 POWER CONTROL ================= */
+
+void bh1750_power_init(void)
+{
+    /*
+       BSS138 gate control.
+
+       P2.4 HIGH = BH1750 sensor ON
+       P2.4 LOW  = BH1750 sensor OFF
+    */
+
+    P2SEL  &= ~BH1750_MOSFET_PIN;
+    P2SEL2 &= ~BH1750_MOSFET_PIN;
+
+    P2OUT &= ~BH1750_MOSFET_PIN;     // OFF at startup
+    P2DIR |= BH1750_MOSFET_PIN;
+}
+
+void bh1750_power_on(void)
+{
+    P2OUT |= BH1750_MOSFET_PIN;
+}
+
+void bh1750_power_off(void)
+{
+    P2OUT &= ~BH1750_MOSFET_PIN;
+}
+
+/* ================= I2C FUNCTIONS ================= */
+
+void i2c_init(void)
+{
+    /*
+       MSP430G2553 USCI_B0 I2C
+       SCL = P1.6
+       SDA = P1.7
+       I2C speed approximately 100 kHz with 1 MHz SMCLK.
+    */
+
+    P1SEL  |= I2C_SCL_PIN | I2C_SDA_PIN;
+    P1SEL2 |= I2C_SCL_PIN | I2C_SDA_PIN;
+
+    UCB0CTL1 |= UCSWRST;        // Hold USCI_B0 in reset
+
+    UCB0CTL0 = UCMST | UCMODE_3 | UCSYNC;    // I2C master, synchronous
+    UCB0CTL1 = UCSWRST | UCSSEL_2;           // SMCLK
+
+    UCB0BR0 = 10;               // 1 MHz / 10 = 100 kHz
+    UCB0BR1 = 0;
+
+    UCB0I2CSA = BH1750_ADDR;
+
+    UCB0CTL1 &= ~UCSWRST;       // Release reset
+
+    IFG2 &= ~(UCB0TXIFG | UCB0RXIFG);
+}
+
+uint8_t i2c_wait_tx_flag(void)
+{
+    uint16_t timeout = 50000;
+
+    while (!(IFG2 & UCB0TXIFG))
+    {
+        if (UCB0STAT & UCNACKIFG)
+        {
+            UCB0STAT &= ~UCNACKIFG;
+            return 0;
+        }
+
+        timeout--;
+
+        if (timeout == 0)
+        {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+uint8_t i2c_wait_rx_flag(void)
+{
+    uint16_t timeout = 50000;
+
+    while (!(IFG2 & UCB0RXIFG))
+    {
+        if (UCB0STAT & UCNACKIFG)
+        {
+            UCB0STAT &= ~UCNACKIFG;
+            return 0;
+        }
+
+        timeout--;
+
+        if (timeout == 0)
+        {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+uint8_t i2c_write_byte(uint8_t address, uint8_t data)
+{
+    uint16_t timeout;
+
+    while (UCB0CTL1 & UCTXSTP);
+
+    UCB0I2CSA = address;
+    UCB0STAT &= ~UCNACKIFG;
+
+    UCB0CTL1 |= UCTR | UCTXSTT;     // Transmitter mode + START
+
+    if (!i2c_wait_tx_flag())
+    {
+        UCB0CTL1 |= UCTXSTP;
+        return 0;
+    }
+
+    UCB0TXBUF = data;
+
+    if (!i2c_wait_tx_flag())
+    {
+        UCB0CTL1 |= UCTXSTP;
+        return 0;
+    }
+
+    UCB0CTL1 |= UCTXSTP;            // STOP
+
+    timeout = 50000;
+    while (UCB0CTL1 & UCTXSTP)
+    {
+        timeout--;
+
+        if (timeout == 0)
+        {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+uint8_t i2c_read_2_bytes(uint8_t address, uint8_t *msb, uint8_t *lsb)
+{
+    uint16_t timeout;
+
+    while (UCB0CTL1 & UCTXSTP);
+
+    UCB0I2CSA = address;
+    UCB0STAT &= ~UCNACKIFG;
+
+    UCB0CTL1 &= ~UCTR;             // Receiver mode
+    UCB0CTL1 |= UCTXSTT;           // START
+
+    /*
+       Wait until START/address phase is complete.
+    */
+
+    timeout = 50000;
+    while (UCB0CTL1 & UCTXSTT)
+    {
+        if (UCB0STAT & UCNACKIFG)
+        {
+            UCB0STAT &= ~UCNACKIFG;
+            UCB0CTL1 |= UCTXSTP;
+            return 0;
+        }
+
+        timeout--;
+
+        if (timeout == 0)
+        {
+            UCB0CTL1 |= UCTXSTP;
+            return 0;
+        }
+    }
+
+    if (!i2c_wait_rx_flag())
+    {
+        UCB0CTL1 |= UCTXSTP;
+        return 0;
+    }
+
+    *msb = UCB0RXBUF;
+
+    /*
+       For 2-byte receive, set STOP before reading the final byte.
+    */
+
+    UCB0CTL1 |= UCTXSTP;
+
+    if (!i2c_wait_rx_flag())
+    {
+        return 0;
+    }
+
+    *lsb = UCB0RXBUF;
+
+    timeout = 50000;
+    while (UCB0CTL1 & UCTXSTP)
+    {
+        timeout--;
+
+        if (timeout == 0)
+        {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+/* ================= BH1750 FUNCTIONS ================= */
+
+uint8_t bh1750_init_sensor(void)
+{
+    /*
+       BH1750 is powered through MOSFET.
+       After power ON, wait before sending I2C commands.
+    */
+
+    if (!i2c_write_byte(BH1750_ADDR, BH1750_POWER_ON))
+    {
+        return 0;
+    }
+
+    delay_ms(10);
+
+    if (!i2c_write_byte(BH1750_ADDR, BH1750_RESET))
+    {
+        return 0;
+    }
+
+    delay_ms(10);
+
+    return 1;
+}
+
+uint8_t bh1750_read_lux_x10(uint32_t *lux_x10)
+{
+    uint8_t msb;
+    uint8_t lsb;
+    uint16_t raw_count;
+
+    /*
+       One-time high resolution mode:
+       measurement time is typically around 120 ms.
+       Use 180 ms for safety.
+    */
+
+    if (!i2c_write_byte(BH1750_ADDR, BH1750_ONE_TIME_HIGH_RES))
+    {
+        return 0;
+    }
+
+    delay_ms(180);
+
+    if (!i2c_read_2_bytes(BH1750_ADDR, &msb, &lsb))
+    {
+        return 0;
+    }
+
+    raw_count = ((uint16_t)msb << 8) | lsb;
+
+    /*
+       BH1750 lux conversion:
+       lux = raw_count / 1.2
+
+       x10 lux:
+       lux_x10 = lux * 10 = raw_count * 100 / 12
+    */
+
+    *lux_x10 = ((uint32_t)raw_count * 100UL) / 12UL;
+
+    return 1;
+}
+
+void sort_u32(uint32_t data[], uint8_t count)
+{
+    uint8_t i;
+    uint8_t j;
+    uint32_t temp;
+
+    for (i = 0; i < count - 1; i++)
+    {
+        for (j = i + 1; j < count; j++)
+        {
+            if (data[j] < data[i])
+            {
+                temp = data[i];
+                data[i] = data[j];
+                data[j] = temp;
+            }
+        }
+    }
+}
+
+uint8_t bh1750_read_trimmed_lux_x10(uint32_t *filtered_lux_x10)
+{
+    /*
+       First-stage filter:
+       - take 5 lux readings
+       - sort readings
+       - remove lowest and highest
+       - average middle 3
+    */
+
+    uint8_t i;
+    uint32_t samples[BH1750_TRIM_SAMPLE_COUNT];
+    uint32_t sum_middle;
+
+    for (i = 0; i < BH1750_TRIM_SAMPLE_COUNT; i++)
+    {
+        if (!bh1750_read_lux_x10(&samples[i]))
+        {
+            return 0;
+        }
+
+        delay_ms(50);
+    }
+
+    sort_u32(samples, BH1750_TRIM_SAMPLE_COUNT);
+
+    sum_middle = samples[1] + samples[2] + samples[3];
+
+    *filtered_lux_x10 = sum_middle / 3;
+
+    return 1;
+}
+
+uint32_t bh1750_calibrate_lux_x10(uint32_t filtered_lux_x10)
+{
+    /*
+       Calibration placeholder.
+
+       At the raw-vs-filtered comparison stage, keep this as identity:
+       calibrated_lux = filtered_lux
+
+       Later, after comparing with your lux meter, replace this function
+       with your calibration equation or piecewise calibration.
+    */
+
+    return filtered_lux_x10;
+}
+
+uint32_t lux_apply_ema_x10(uint32_t new_lux_x10)
+{
+    /*
+       EMA filter on calibrated lux:
+       alpha = 0.25
+    */
+
+    if (!lux_ema_initialized)
+    {
+        lux_ema_x10 = new_lux_x10;
+        lux_ema_initialized = 1;
+    }
+    else
+    {
+        lux_ema_x10 =
+            ((LUX_EMA_NEW_WEIGHT * new_lux_x10) +
+             (LUX_EMA_OLD_WEIGHT * lux_ema_x10)) /
+            (LUX_EMA_NEW_WEIGHT + LUX_EMA_OLD_WEIGHT);
+    }
+
+    return lux_ema_x10;
+}
+
+/* ================= MAIN ================= */
+
+int main(void)
+{
+    uint16_t sample_number;
+
+    uint32_t raw_lux_x10;
+    uint32_t filtered_lux_x10;
+    uint32_t calibrated_lux_x10;
+    uint32_t ema_lux_x10;
+
+    uint8_t raw_ok;
+    uint8_t filtered_ok;
+    uint8_t status;
+
+    clock_init();
+    uart_init();
+    bh1750_power_init();
+
+    uart_puts("\r\n============================================================\r\n");
+    uart_puts("BH1750 RAW VS FILTERED COMPARISON TEST\r\n");
+    uart_puts("I2C SCL: P1.6\r\n");
+    uart_puts("I2C SDA: P1.7\r\n");
+    uart_puts("BH1750 BSS138 MOSFET gate: P2.4\r\n");
+    uart_puts("UART TX: P1.2, 9600 baud\r\n");
+    uart_puts("============================================================\r\n");
+
+    bh1750_power_on();
+
+    uart_puts("BH1750 sensor ON\r\n");
+    uart_puts("Waiting 300 ms for sensor power stabilization...\r\n");
+    delay_ms(300);
+
+    i2c_init();
+
+    if (!bh1750_init_sensor())
+    {
+        uart_puts("ERROR: BH1750 not responding. Check wiring/address/pullups.\r\n");
+        bh1750_power_off();
+
+        while (1)
+        {
+            __bis_SR_register(LPM4_bits);
+        }
+    }
+
+    uart_puts("BH1750 initialized\r\n");
+
+    /*
+       Dummy reading after power-up.
+       This value is not used in the analysis.
+    */
+
+    bh1750_read_lux_x10(&raw_lux_x10);
+
+    uart_puts("\r\nsample,raw_lux,filtered_lux,calibrated_lux,ema_lux,status\r\n");
+
+    for (sample_number = 1; sample_number <= TOTAL_SAMPLES; sample_number++)
+    {
+        raw_lux_x10 = 0;
+        filtered_lux_x10 = 0;
+        calibrated_lux_x10 = 0;
+        ema_lux_x10 = 0;
+        status = 0;
+
+        /*
+           raw_lux:
+           One direct BH1750 reading.
+
+           filtered_lux:
+           5 readings -> sort -> remove lowest/highest -> average middle 3.
+
+           calibrated_lux:
+           Currently same as filtered_lux. Later replace with lux meter calibration.
+
+           ema_lux:
+           EMA applied after calibration.
+        */
+
+        raw_ok = bh1750_read_lux_x10(&raw_lux_x10);
+
+        filtered_ok = bh1750_read_trimmed_lux_x10(&filtered_lux_x10);
+
+        if (raw_ok && filtered_ok)
+        {
+            calibrated_lux_x10 = bh1750_calibrate_lux_x10(filtered_lux_x10);
+            ema_lux_x10 = lux_apply_ema_x10(calibrated_lux_x10);
+            status = 1;
+        }
+
+        uart_print_uint16(sample_number);
+        uart_putc(',');
+
+        uart_print_x10(raw_lux_x10);
+        uart_putc(',');
+
+        uart_print_x10(filtered_lux_x10);
+        uart_putc(',');
+
+        uart_print_x10(calibrated_lux_x10);
+        uart_putc(',');
+
+        uart_print_x10(ema_lux_x10);
+        uart_putc(',');
+
+        uart_print_uint32(status);
+        uart_puts("\r\n");
+
+        delay_ms(SAMPLE_DELAY_MS);
+    }
+
+    bh1750_power_off();
+
+    uart_puts("\r\nTest complete. BH1750 sensor OFF.\r\n");
+
+    while (1)
+    {
+        __bis_SR_register(LPM4_bits);
+    }
+}
