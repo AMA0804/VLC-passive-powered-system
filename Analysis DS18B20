@@ -1,0 +1,568 @@
+#include <msp430.h>
+#include <stdint.h>
+
+/*
+   DS18B20 soil/corm temperature raw vs filtered comparison test
+   MCU: MSP430G2553
+   IDE: Code Composer Studio
+
+   CSV output:
+   sample,raw_soil_temp_C,ema_soil_temp_C,status
+
+   DS18B20 DATA pin:
+   P1.1
+
+   UART TX:
+   P1.2, 9600 baud
+
+   Important:
+   DS18B20 is kept always powered.
+   Do not switch DS18B20 power with BSS138 for this test.
+   Use an external 4.7k pull-up resistor from DATA to 3.3V.
+*/
+
+/* ================= PIN DEFINITIONS ================= */
+
+#define DS18B20_PIN          BIT1      // P1.1 -> DS18B20 DATA
+#define UART_TX_PIN          BIT2      // P1.2 -> UART TX
+
+/* ================= DS18B20 COMMANDS ================= */
+
+#define DS18B20_SKIP_ROM     0xCC
+#define DS18B20_CONVERT_T    0x44
+#define DS18B20_READ_SCRATCH 0xBE
+
+/* ================= TEST SETTINGS ================= */
+
+#define TOTAL_SAMPLES        100
+#define SAMPLE_DELAY_MS      1000
+
+/* ================= FILTER SETTINGS ================= */
+
+/*
+   EMA alpha = 0.15 for soil/corm temperature
+
+   filtered = 0.15 * new + 0.85 * old
+
+   Soil/corm temperature changes slowly, so alpha is smaller
+   than air temperature and humidity.
+*/
+
+#define SOIL_TEMP_EMA_NEW_WEIGHT   15
+#define SOIL_TEMP_EMA_OLD_WEIGHT   85
+
+/* ================= GLOBAL VARIABLES ================= */
+
+int32_t soil_temp_ema_x100 = 0;
+uint8_t soil_temp_ema_initialized = 0;
+
+/* ================= DELAY FUNCTIONS ================= */
+
+void delay_us(uint16_t us)
+{
+    while (us--)
+    {
+        __delay_cycles(1);       // 1 MHz clock -> 1 us
+    }
+}
+
+void delay_ms(uint16_t ms)
+{
+    while (ms--)
+    {
+        __delay_cycles(1000);    // 1 MHz clock -> 1 ms
+    }
+}
+
+/* ================= CLOCK INIT ================= */
+
+void clock_init(void)
+{
+    WDTCTL = WDTPW | WDTHOLD;    // Stop watchdog timer
+
+    /*
+       Set DCO to 1 MHz.
+       This is used for UART timing and 1-Wire timing.
+    */
+
+    if (CALBC1_1MHZ != 0xFF)
+    {
+        DCOCTL = 0;
+        BCSCTL1 = CALBC1_1MHZ;
+        DCOCTL = CALDCO_1MHZ;
+    }
+}
+
+/* ================= UART FUNCTIONS ================= */
+
+void uart_init(void)
+{
+    /*
+       UART TX only.
+       P1.2 = UCA0TXD
+       Baud rate = 9600
+       Clock = 1 MHz SMCLK
+
+       P1.1 is NOT configured as UART RX.
+       P1.1 is used for DS18B20 DATA.
+    */
+
+    P1SEL  |= UART_TX_PIN;
+    P1SEL2 |= UART_TX_PIN;
+
+    UCA0CTL1 |= UCSWRST;
+    UCA0CTL1 |= UCSSEL_2;       // SMCLK
+
+    UCA0BR0 = 104;              // 1 MHz / 9600
+    UCA0BR1 = 0;
+    UCA0MCTL = UCBRS0;
+
+    UCA0CTL1 &= ~UCSWRST;
+}
+
+void uart_putc(char c)
+{
+    while (!(IFG2 & UCA0TXIFG));
+    UCA0TXBUF = c;
+}
+
+void uart_puts(const char *str)
+{
+    while (*str)
+    {
+        uart_putc(*str++);
+    }
+}
+
+void uart_print_uint32(uint32_t value)
+{
+    char buffer[11];
+    uint8_t i = 0;
+
+    if (value == 0)
+    {
+        uart_putc('0');
+        return;
+    }
+
+    while (value > 0)
+    {
+        buffer[i++] = (char)((value % 10) + '0');
+        value /= 10;
+    }
+
+    while (i > 0)
+    {
+        uart_putc(buffer[--i]);
+    }
+}
+
+void uart_print_uint16(uint16_t value)
+{
+    uart_print_uint32((uint32_t)value);
+}
+
+void uart_print_int_x100(int32_t value_x100)
+{
+    /*
+       Print signed x100 fixed-point value.
+
+       Example:
+       2550  -> 25.50
+       2543  -> 25.43
+       -125  -> -1.25
+    */
+
+    uint32_t abs_value;
+    uint32_t integer_part;
+    uint32_t decimal_part;
+
+    if (value_x100 < 0)
+    {
+        uart_putc('-');
+        abs_value = (uint32_t)(-value_x100);
+    }
+    else
+    {
+        abs_value = (uint32_t)value_x100;
+    }
+
+    integer_part = abs_value / 100;
+    decimal_part = abs_value % 100;
+
+    uart_print_uint32(integer_part);
+    uart_putc('.');
+
+    if (decimal_part < 10)
+    {
+        uart_putc('0');
+    }
+
+    uart_print_uint32(decimal_part);
+}
+
+/* ================= DS18B20 1-WIRE LOW LEVEL ================= */
+
+void ds18b20_bus_prepare(void)
+{
+    /*
+       DS18B20 DATA = P1.1
+
+       External 4.7k pull-up resistor is required:
+       DATA -> 4.7k -> 3.3V
+
+       Internal pull-up is also enabled to help keep the bus stable.
+    */
+
+    P1SEL  &= ~DS18B20_PIN;
+    P1SEL2 &= ~DS18B20_PIN;
+
+    P1OUT |= DS18B20_PIN;       // Pull-up direction
+    P1REN |= DS18B20_PIN;       // Enable internal pull-up
+    P1DIR &= ~DS18B20_PIN;      // Release bus
+
+    delay_ms(10);
+}
+
+void onewire_drive_low(void)
+{
+    P1SEL  &= ~DS18B20_PIN;
+    P1SEL2 &= ~DS18B20_PIN;
+
+    P1OUT &= ~DS18B20_PIN;
+    P1DIR |= DS18B20_PIN;       // Output LOW
+}
+
+void onewire_release_bus(void)
+{
+    P1SEL  &= ~DS18B20_PIN;
+    P1SEL2 &= ~DS18B20_PIN;
+
+    P1OUT |= DS18B20_PIN;
+    P1REN |= DS18B20_PIN;
+    P1DIR &= ~DS18B20_PIN;      // Input, pulled HIGH
+}
+
+uint8_t onewire_reset(void)
+{
+    /*
+       Returns:
+       1 = DS18B20 presence detected
+       0 = no presence detected
+    */
+
+    uint8_t presence;
+
+    __disable_interrupt();
+
+    onewire_drive_low();
+    delay_us(480);
+
+    onewire_release_bus();
+    delay_us(70);
+
+    presence = ((P1IN & DS18B20_PIN) == 0) ? 1 : 0;
+
+    delay_us(410);
+
+    __enable_interrupt();
+
+    return presence;
+}
+
+void onewire_write_bit(uint8_t bit_value)
+{
+    __disable_interrupt();
+
+    if (bit_value)
+    {
+        onewire_drive_low();
+        delay_us(6);
+        onewire_release_bus();
+        delay_us(64);
+    }
+    else
+    {
+        onewire_drive_low();
+        delay_us(60);
+        onewire_release_bus();
+        delay_us(10);
+    }
+
+    __enable_interrupt();
+}
+
+uint8_t onewire_read_bit(void)
+{
+    uint8_t bit_value;
+
+    __disable_interrupt();
+
+    onewire_drive_low();
+    delay_us(6);
+
+    onewire_release_bus();
+    delay_us(9);
+
+    bit_value = (P1IN & DS18B20_PIN) ? 1 : 0;
+
+    delay_us(55);
+
+    __enable_interrupt();
+
+    return bit_value;
+}
+
+void onewire_write_byte(uint8_t data)
+{
+    uint8_t i;
+
+    for (i = 0; i < 8; i++)
+    {
+        onewire_write_bit(data & 0x01);
+        data >>= 1;
+    }
+}
+
+uint8_t onewire_read_byte(void)
+{
+    uint8_t i;
+    uint8_t data = 0;
+
+    for (i = 0; i < 8; i++)
+    {
+        if (onewire_read_bit())
+        {
+            data |= (1 << i);
+        }
+    }
+
+    return data;
+}
+
+/* ================= DS18B20 FUNCTIONS ================= */
+
+uint8_t ds18b20_crc8(uint8_t *data, uint8_t length)
+{
+    /*
+       Dallas/Maxim 1-Wire CRC-8
+       Polynomial: x^8 + x^5 + x^4 + 1
+       Reversed polynomial used in LSB-first calculation = 0x8C
+    */
+
+    uint8_t crc = 0;
+    uint8_t i;
+    uint8_t j;
+
+    for (i = 0; i < length; i++)
+    {
+        uint8_t inbyte = data[i];
+
+        for (j = 0; j < 8; j++)
+        {
+            uint8_t mix = (crc ^ inbyte) & 0x01;
+
+            crc >>= 1;
+
+            if (mix)
+            {
+                crc ^= 0x8C;
+            }
+
+            inbyte >>= 1;
+        }
+    }
+
+    return crc;
+}
+
+uint8_t ds18b20_read_temperature_x100(int32_t *temperature_x100)
+{
+    uint8_t scratchpad[9];
+    uint8_t i;
+    int16_t raw_temp;
+
+    /*
+       Step 1: Reset and check presence.
+    */
+
+    ds18b20_bus_prepare();
+
+    if (!onewire_reset())
+    {
+        return 0;
+    }
+
+    /*
+       Step 2: Start temperature conversion.
+       SKIP ROM is used because only one DS18B20 is connected on the bus.
+    */
+
+    onewire_write_byte(DS18B20_SKIP_ROM);
+    onewire_write_byte(DS18B20_CONVERT_T);
+
+    /*
+       12-bit conversion can take up to 750 ms.
+    */
+
+    delay_ms(750);
+
+    /*
+       Step 3: Reset again before reading scratchpad.
+    */
+
+    if (!onewire_reset())
+    {
+        return 0;
+    }
+
+    onewire_write_byte(DS18B20_SKIP_ROM);
+    onewire_write_byte(DS18B20_READ_SCRATCH);
+
+    for (i = 0; i < 9; i++)
+    {
+        scratchpad[i] = onewire_read_byte();
+    }
+
+    /*
+       Step 4: CRC check.
+       scratchpad[8] is CRC of scratchpad[0..7].
+    */
+
+    if (ds18b20_crc8(scratchpad, 8) != scratchpad[8])
+    {
+        return 0;
+    }
+
+    /*
+       Step 5: Convert raw temperature to Celsius.
+
+       DS18B20 12-bit resolution:
+       raw_temp / 16 = temperature in Celsius
+
+       x100 format:
+       temperature_x100 = raw_temp * 100 / 16
+    */
+
+    raw_temp = (int16_t)(((uint16_t)scratchpad[1] << 8) | scratchpad[0]);
+
+    *temperature_x100 = ((int32_t)raw_temp * 100) / 16;
+
+    /*
+       Sanity check for DS18B20 normal range.
+       -55.00 C to 125.00 C
+    */
+
+    if (*temperature_x100 < -5500)
+    {
+        return 0;
+    }
+
+    if (*temperature_x100 > 12500)
+    {
+        return 0;
+    }
+
+    return 1;
+}
+
+int32_t soil_temp_apply_ema_x100(int32_t new_temp_x100)
+{
+    /*
+       EMA filter:
+       alpha = 0.15
+
+       First valid reading initializes the EMA.
+    */
+
+    if (!soil_temp_ema_initialized)
+    {
+        soil_temp_ema_x100 = new_temp_x100;
+        soil_temp_ema_initialized = 1;
+    }
+    else
+    {
+        soil_temp_ema_x100 =
+            ((SOIL_TEMP_EMA_NEW_WEIGHT * new_temp_x100) +
+             (SOIL_TEMP_EMA_OLD_WEIGHT * soil_temp_ema_x100)) /
+            (SOIL_TEMP_EMA_NEW_WEIGHT + SOIL_TEMP_EMA_OLD_WEIGHT);
+    }
+
+    return soil_temp_ema_x100;
+}
+
+/* ================= MAIN ================= */
+
+int main(void)
+{
+    uint16_t sample_number;
+
+    int32_t raw_soil_temp_x100;
+    int32_t ema_soil_temp_x100;
+
+    uint8_t status;
+
+    clock_init();
+    uart_init();
+    ds18b20_bus_prepare();
+
+    uart_puts("\r\n============================================================\r\n");
+    uart_puts("DS18B20 SOIL/CORM TEMPERATURE RAW VS EMA FILTERED TEST\r\n");
+    uart_puts("DS18B20 DATA: P1.1\r\n");
+    uart_puts("UART TX: P1.2, 9600 baud\r\n");
+    uart_puts("External pull-up: 4.7k from DATA to 3.3V\r\n");
+    uart_puts("Filter: valid read + CRC check + EMA alpha 0.15\r\n");
+    uart_puts("============================================================\r\n");
+
+    delay_ms(500);
+
+    uart_puts("\r\nsample,raw_soil_temp_C,ema_soil_temp_C,status\r\n");
+
+    for (sample_number = 1; sample_number <= TOTAL_SAMPLES; sample_number++)
+    {
+        raw_soil_temp_x100 = 0;
+        ema_soil_temp_x100 = 0;
+        status = 0;
+
+        if (ds18b20_read_temperature_x100(&raw_soil_temp_x100))
+        {
+            ema_soil_temp_x100 = soil_temp_apply_ema_x100(raw_soil_temp_x100);
+            status = 1;
+        }
+        else
+        {
+            /*
+               If reading fails, keep previous EMA value.
+               If EMA has not been initialized, print 0.00.
+            */
+
+            if (soil_temp_ema_initialized)
+            {
+                ema_soil_temp_x100 = soil_temp_ema_x100;
+            }
+
+            status = 0;
+        }
+
+        uart_print_uint16(sample_number);
+        uart_putc(',');
+
+        uart_print_int_x100(raw_soil_temp_x100);
+        uart_putc(',');
+
+        uart_print_int_x100(ema_soil_temp_x100);
+        uart_putc(',');
+
+        uart_print_uint32(status);
+        uart_puts("\r\n");
+
+        delay_ms(SAMPLE_DELAY_MS);
+    }
+
+    uart_puts("\r\nTest complete.\r\n");
+
+    while (1)
+    {
+        __bis_SR_register(LPM4_bits);
+    }
+}
