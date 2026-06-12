@@ -1,0 +1,225 @@
+#include <msp430.h>
+#include <stdint.h>
+
+/* ================= PIN DEFINITIONS ================= */
+
+#define SOIL_ADC_PIN        BIT3    // P1.3 / A3 -> Soil moisture analog output
+#define SOIL_ADC_CHANNEL    INCH_3  // ADC channel A3
+
+#define SOIL_MOSFET_PIN     BIT4    // P1.4 -> BSS138 gate for soil sensor power
+
+#define UART_TX_PIN         BIT2    // P1.2 -> UART TX
+
+/* ================= TEST SETTINGS ================= */
+
+#define TOTAL_SAMPLES       100
+#define SAMPLE_DELAY_MS     1000    // 1 second between samples
+
+/* ================= DELAY FUNCTIONS ================= */
+
+void delay_us(uint16_t us)
+{
+    while (us--)
+    {
+        __delay_cycles(1);   // 1 MHz clock -> 1 us
+    }
+}
+
+void delay_ms(uint16_t ms)
+{
+    while (ms--)
+    {
+        __delay_cycles(1000); // 1 MHz clock -> 1 ms
+    }
+}
+
+/* ================= CLOCK INIT ================= */
+
+void clock_init(void)
+{
+    /*
+       Set DCO to 1 MHz.
+       This is used for UART timing and delay timing.
+    */
+
+    WDTCTL = WDTPW | WDTHOLD;   // Stop watchdog timer
+
+    if (CALBC1_1MHZ != 0xFF)
+    {
+        DCOCTL = 0;
+        BCSCTL1 = CALBC1_1MHZ;
+        DCOCTL = CALDCO_1MHZ;
+    }
+}
+
+/* ================= UART FUNCTIONS ================= */
+
+void uart_init(void)
+{
+    /*
+       UART TX only
+       P1.2 = UCA0TXD
+       Baud rate = 9600
+       Clock = 1 MHz SMCLK
+    */
+
+    P1SEL  |= UART_TX_PIN;
+    P1SEL2 |= UART_TX_PIN;
+
+    UCA0CTL1 |= UCSWRST;        // Hold USCI in reset
+    UCA0CTL1 |= UCSSEL_2;       // SMCLK
+
+    UCA0BR0 = 104;              // 1MHz / 9600 = 104.16
+    UCA0BR1 = 0;
+    UCA0MCTL = UCBRS0;          // Modulation
+
+    UCA0CTL1 &= ~UCSWRST;       // Release USCI reset
+}
+
+void uart_putc(char c)
+{
+    while (!(IFG2 & UCA0TXIFG));
+    UCA0TXBUF = c;
+}
+
+void uart_puts(const char *str)
+{
+    while (*str)
+    {
+        uart_putc(*str++);
+    }
+}
+
+void uart_print_uint16(uint16_t value)
+{
+    char buffer[6];
+    uint8_t i = 0;
+
+    if (value == 0)
+    {
+        uart_putc('0');
+        return;
+    }
+
+    while (value > 0)
+    {
+        buffer[i++] = (value % 10) + '0';
+        value /= 10;
+    }
+
+    while (i > 0)
+    {
+        uart_putc(buffer[--i]);
+    }
+}
+
+/* ================= SOIL SENSOR POWER ================= */
+
+void soil_sensor_power_init(void)
+{
+    /*
+       BSS138 MOSFET gate control.
+       P1.4 HIGH = soil sensor ON
+       P1.4 LOW  = soil sensor OFF
+    */
+
+    P1SEL  &= ~SOIL_MOSFET_PIN;
+    P1SEL2 &= ~SOIL_MOSFET_PIN;
+
+    P1OUT &= ~SOIL_MOSFET_PIN;  // Sensor OFF initially
+    P1DIR |= SOIL_MOSFET_PIN;
+}
+
+void soil_sensor_on(void)
+{
+    P1OUT |= SOIL_MOSFET_PIN;
+}
+
+void soil_sensor_off(void)
+{
+    P1OUT &= ~SOIL_MOSFET_PIN;
+}
+
+/* ================= ADC FUNCTIONS ================= */
+
+void adc_init(void)
+{
+    /*
+       Soil moisture sensor analog output:
+       P1.3 / A3
+    */
+
+    ADC10CTL0 &= ~ENC;          // Disable ADC before configuration
+
+    ADC10AE0 |= SOIL_ADC_PIN;   // Enable analog input on P1.3
+
+    ADC10CTL1 = SOIL_ADC_CHANNEL | ADC10DIV_3;
+    ADC10CTL0 = SREF_0 | ADC10SHT_3 | ADC10ON;
+
+    delay_ms(10);
+}
+
+uint16_t adc_read_soil_raw(void)
+{
+    uint16_t adc_value;
+
+    ADC10CTL0 &= ~ENC;
+    ADC10CTL1 = SOIL_ADC_CHANNEL | ADC10DIV_3;
+    ADC10CTL0 |= ENC | ADC10SC;     // Start conversion
+
+    while (ADC10CTL1 & ADC10BUSY);
+
+    adc_value = ADC10MEM;
+
+    return adc_value;
+}
+
+/* ================= MAIN ================= */
+
+int main(void)
+{
+    uint16_t i;
+    uint16_t raw_adc;
+
+    clock_init();
+    uart_init();
+    soil_sensor_power_init();
+    adc_init();
+
+    uart_puts("\r\n=====================================\r\n");
+    uart_puts("SOIL MOISTURE RAW ADC TEST\r\n");
+    uart_puts("Sensor power MOSFET: P1.4\r\n");
+    uart_puts("Soil ADC input: P1.3 / A3\r\n");
+    uart_puts("Samples: 100 raw readings\r\n");
+    uart_puts("No filtering, no calibration\r\n");
+    uart_puts("=====================================\r\n");
+
+    uart_puts("Turning ON soil sensor...\r\n");
+    soil_sensor_on();
+
+    uart_puts("Waiting 2 seconds for stabilization...\r\n");
+    delay_ms(2000);
+
+    uart_puts("\r\nsample,soil_raw_adc\r\n");
+
+    for (i = 1; i <= TOTAL_SAMPLES; i++)
+    {
+        raw_adc = adc_read_soil_raw();
+
+        uart_print_uint16(i);
+        uart_putc(',');
+        uart_print_uint16(raw_adc);
+        uart_puts("\r\n");
+
+        delay_ms(SAMPLE_DELAY_MS);
+    }
+
+    soil_sensor_off();
+
+    uart_puts("\r\nTest complete. Soil sensor OFF.\r\n");
+
+    while (1)
+    {
+        __bis_SR_register(LPM4_bits);
+    }
+}
